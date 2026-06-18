@@ -55,7 +55,7 @@ class Config:
     LOG_CHANNEL_ID: int       = int(os.environ.get("LOG_CHANNEL_ID", "1517107696200061040"))
     CATEGORY_GENERAL: int     = int(os.environ.get("CATEGORY_GENERAL", "1517099911269580891"))
     STAFF_TICKET_ROLE_ID: int = int(os.environ.get("STAFF_TICKET_ROLE_ID", "1517123223836295188"))
-    ADMIN_ROLE_ID: int        = int(os.environ.get("ADMIN_ROLE_ID", "1517091767399350342"))
+    ADMIN_ROLE_ID: int        = int(os.environ.get("ADMIN_ROLE_ID", "1517123223836295188"))
 
     # DATABASE_URL fornito da Railway
     DATABASE_URL: str = os.environ.get("DATABASE_URL", "")
