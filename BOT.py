@@ -83,7 +83,7 @@ class Config:
     COOLDOWN_SECONDS:        int = 30
     AUTO_CLOSE_HOURS:        int = 48
     AUTO_CLOSE_CHECK_MINUTES: int = 30
-    CLOSE_DELAY:             int = 600   # secondi prima della chiusura definitiva
+    CLOSE_DELAY:             int = 30   # secondi prima della chiusura definitiva
 
     CATEGORIE: tuple = field(default_factory=lambda: (
         "Supporto Tecnico",
