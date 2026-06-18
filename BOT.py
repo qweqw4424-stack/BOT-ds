@@ -74,10 +74,10 @@ log = logging.getLogger("TicketBot")
 class Config:
     TOKEN: str = field(default_factory=lambda: os.environ.get("BOT_TOKEN", ""))
     GUILD_ID: int             = field(default_factory=lambda: int(os.environ.get("GUILD_ID", "0")))
-    LOG_CHANNEL_ID: int       = field(default_factory=lambda: int(os.environ.get("LOG_CHANNEL_ID", "0")))
-    CATEGORY_GENERAL: int     = field(default_factory=lambda: int(os.environ.get("CATEGORY_GENERAL", "0")))
-    STAFF_TICKET_ROLE_ID: int = field(default_factory=lambda: int(os.environ.get("STAFF_TICKET_ROLE_ID", "0")))
-    ADMIN_ROLE_ID: int        = field(default_factory=lambda: int(os.environ.get("ADMIN_ROLE_ID", "0")))
+    LOG_CHANNEL_ID: int       = 1517107696200061040
+    CATEGORY_GENERAL: int     = 1517099911269580891
+    STAFF_TICKET_ROLE_ID: int = 1517123223836295188
+    ADMIN_ROLE_ID: int        = 1517123223836295188
     DATABASE_URL: str         = field(default_factory=lambda: os.environ.get("DATABASE_URL", ""))
 
     MAX_OPEN_TICKETS: int         = 2
@@ -100,11 +100,11 @@ class Config:
     def __post_init__(self) -> None:
         if not self.CATEGORIA_ROLES:
             self.CATEGORIA_ROLES = {
-                "Supporto Tecnico":  int(os.environ.get("ROLE_SUPPORT_ID", "0")),
-                "Report Utente":     int(os.environ.get("ROLE_REPORT_ID", "0")),
-                "Candidatura Staff": int(os.environ.get("ROLE_STAFF_CANDIDATE_ID", "0")),
-                "Unisciti al Team":  int(os.environ.get("ROLE_JOIN_TEAM_ID", "0")),
-                "Altro":             int(os.environ.get("ROLE_OTHER_ID", "0")),
+                "Supporto Tecnico":  1517123223836295188
+                "Report Utente":     1517123223836295188
+                "Candidatura Staff": 1517123223836295188
+                "Unisciti al Team":  1517123223836295188
+                "Altro":             1517123223836295188
             }
 
     def validate(self) -> None:
