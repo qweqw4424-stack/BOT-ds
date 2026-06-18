@@ -19,7 +19,7 @@ CHANGELOG rispetto alla versione precedente:
 - MIGLIORAMENTO: /reopen slash command implementato
 - MIGLIORAMENTO: /adduser e /removeuser slash command
 - MIGLIORAMENTO: Logging migliorato con contesto strutturato
-- MIGLIORAMENTO: Gestione errori più granulare con rollback
+- MIGLIORAMENTO: Gestione errori più granular con rollback
 - MIGLIORAMENTO: Auto-close mostra avviso nel canale prima di chiudere
 - MIGLIORAMENTO: Blacklist mostra lista formattata con /blacklist_list
 - MIGLIORAMENTO: Transcript fallback testuale se chat_exporter non disponibile
@@ -72,19 +72,22 @@ log = logging.getLogger("TicketBot")
 # ══════════════════════════════════════════════════════════════════
 @dataclass
 class Config:
+    # Variabili lette da environment (non devono essere scritte nel file)
     TOKEN: str = field(default_factory=lambda: os.environ.get("BOT_TOKEN", ""))
-    GUILD_ID: int             = field(default_factory=lambda: int(os.environ.get("GUILD_ID", "0")))
-    LOG_CHANNEL_ID: int       = 1517107696200061040
-    CATEGORY_GENERAL: int     = 1517099911269580891
-    STAFF_TICKET_ROLE_ID: int = 1517123223836295188
-    ADMIN_ROLE_ID: int        = 1517123223836295188
-    DATABASE_URL: str         = field(default_factory=lambda: os.environ.get("DATABASE_URL", ""))
+    GUILD_ID: int = field(default_factory=lambda: int(os.environ.get("GUILD_ID", "0")))
+    DATABASE_URL: str = field(default_factory=lambda: os.environ.get("DATABASE_URL", ""))
 
-    MAX_OPEN_TICKETS: int         = 2
-    COOLDOWN_SECONDS: int         = 30
-    AUTO_CLOSE_HOURS: int         = 48
+    # Variabili hardcoded direttamente nel file .py
+    LOG_CHANNEL_ID: int = 1517107696200061040  # Sostituire con l'ID del canale di log desiderato
+    CATEGORY_GENERAL: int = 1517099911269580891  # Sostituire con l'ID della categoria generale per i ticket
+    STAFF_TICKET_ROLE_ID: int = 1517123223836295188  # Sostituire con l'ID del ruolo staff generico per i ticket
+    ADMIN_ROLE_ID: int = 1517123223836295188  # Sostituire con l'ID del ruolo amministratore
+
+    MAX_OPEN_TICKETS: int = 2
+    COOLDOWN_SECONDS: int = 30
+    AUTO_CLOSE_HOURS: int = 48
     AUTO_CLOSE_CHECK_MINUTES: int = 30
-    CLOSE_DELAY: int              = 600
+    CLOSE_DELAY: int = 600
 
     CATEGORIE: tuple = field(default_factory=lambda: (
         "Supporto Tecnico",
@@ -94,17 +97,17 @@ class Config:
         "Altro",
     ))
 
-    # Compilato in __post_init__
+    # Ruoli specifici per categoria, hardcoded
     CATEGORIA_ROLES: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.CATEGORIA_ROLES:
             self.CATEGORIA_ROLES = {
-                "Supporto Tecnico":  1517123223836295188
-                "Report Utente":     1517123223836295188
-                "Candidatura Staff": 1517123223836295188
-                "Unisciti al Team":  1517123223836295188
-                "Altro":             1517123223836295188
+                "Supporto Tecnico":  1517123223836295188,  # Sostituire con l'ID del ruolo per Supporto Tecnico
+                "Report Utente":     1517123223836295188,  # Sostituire con l'ID del ruolo per Report Utente
+                "Candidatura Staff": 1517123223836295188,  # Sostituire con l'ID del ruolo per Candidatura Staff
+                "Unisciti al Team":  1517123223836295188,  # Sostituire con l'ID del ruolo per Unisciti al Team
+                "Altro":             1517123223836295188,  # Sostituire con l'ID del ruolo per Altro
             }
 
     def validate(self) -> None:
@@ -117,9 +120,13 @@ class Config:
             errors.append("GUILD_ID non impostato o non valido")
         if self.CATEGORY_GENERAL == 0:
             errors.append("CATEGORY_GENERAL non impostato — il bot non potrà creare canali ticket")
+        # Aggiungere qui altre validazioni se necessario per gli ID hardcoded
         if errors:
+            import logging
+            log = logging.getLogger("TicketBot")
             for e in errors:
                 log.critical("Configurazione mancante: %s", e)
+            import sys
             sys.exit(1)
 
 
@@ -361,22 +368,23 @@ class Database:
     async def touch_last_message(self, channel_id: int) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
-                """UPDATE tickets
-                   SET last_message = CURRENT_TIMESTAMP
-                   WHERE channel_id = $1 AND status = 'open'""",
+                "UPDATE tickets SET last_message = CURRENT_TIMESTAMP WHERE channel_id = $1",
                 channel_id,
             )
 
     async def count_open_tickets(self, user_id: int) -> int:
         async with self._pool.acquire() as conn:
-            return await conn.fetchval(
-                "SELECT COUNT(*) FROM tickets WHERE user_id = $1 AND status IN ('open','closing')",
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM tickets WHERE user_id = $1 AND status = 'open'",
                 user_id,
             )
+            return count or 0
 
     async def load_open_channel_ids(self) -> set[int]:
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch("SELECT channel_id FROM tickets WHERE status = 'open'")
+            rows = await conn.fetch(
+                "SELECT channel_id FROM tickets WHERE status = 'open' OR status = 'closing'"
+            )
             return {r["channel_id"] for r in rows}
 
     async def get_inactive_tickets(self, cutoff: datetime.datetime) -> list[asyncpg.Record]:
@@ -386,114 +394,89 @@ class Database:
                 cutoff,
             )
 
-    # BUG FIX: aggiunto reopen
     async def reopen_ticket(self, channel_id: int) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
-                """UPDATE tickets
-                   SET status = 'open', closed_by = NULL,
-                       closed_at = NULL, close_reason = NULL
-                   WHERE channel_id = $1""",
+                "UPDATE tickets SET status = 'open', closed_by = NULL, closed_at = NULL, close_reason = NULL WHERE channel_id = $1",
                 channel_id,
             )
 
     # ── Blacklist ─────────────────────────────────────────────────
     async def is_blacklisted(self, user_id: int) -> bool:
         async with self._pool.acquire() as conn:
-            return (
-                await conn.fetchval(
-                    "SELECT 1 FROM blacklist WHERE user_id = $1", user_id
-                )
-            ) is not None
+            row = await conn.fetchrow(
+                "SELECT 1 FROM blacklist WHERE user_id = $1", user_id
+            )
+            return row is not None
 
     async def blacklist_add(self, user_id: int, reason: str, added_by: int) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
-                """INSERT INTO blacklist (user_id, reason, added_by) VALUES ($1, $2, $3)
-                   ON CONFLICT(user_id) DO UPDATE
-                   SET reason = EXCLUDED.reason,
-                       added_by = EXCLUDED.added_by,
-                       added_at = CURRENT_TIMESTAMP""",
+                """INSERT INTO blacklist (user_id, reason, added_by)
+                   VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE
+                   SET reason = $2, added_by = $3, added_at = CURRENT_TIMESTAMP""",
                 user_id, reason, added_by,
             )
 
     async def blacklist_remove(self, user_id: int) -> bool:
         async with self._pool.acquire() as conn:
-            res = await conn.execute(
+            result = await conn.execute(
                 "DELETE FROM blacklist WHERE user_id = $1", user_id
             )
-            return "DELETE 1" in res
+            return result == "DELETE 1"
 
     async def blacklist_list(self) -> list[asyncpg.Record]:
         async with self._pool.acquire() as conn:
-            return await conn.fetch(
-                "SELECT * FROM blacklist ORDER BY added_at DESC LIMIT 25"
-            )
+            return await conn.fetch("SELECT * FROM blacklist ORDER BY added_at DESC")
 
-    # ── Cooldown ──────────────────────────────────────────────────
+    # ── Cooldowns ─────────────────────────────────────────────────
     async def check_cooldown(self, user_id: int) -> int:
         async with self._pool.acquire() as conn:
             last_open = await conn.fetchval(
                 "SELECT last_open FROM cooldowns WHERE user_id = $1", user_id
             )
-            if not last_open:
-                return 0
-            last_open = ensure_tz(last_open)
-            elapsed = (utcnow() - last_open).total_seconds()
-            return max(0, cfg.COOLDOWN_SECONDS - int(elapsed))
+            if last_open:
+                elapsed = (utcnow() - ensure_tz(last_open)).total_seconds()
+                remaining = max(0, cfg.COOLDOWN_SECONDS - int(elapsed))
+                return remaining
+            return 0
 
     async def update_cooldown(self, user_id: int) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
-                """INSERT INTO cooldowns (user_id, last_open) VALUES ($1, CURRENT_TIMESTAMP)
-                   ON CONFLICT(user_id) DO UPDATE SET last_open = CURRENT_TIMESTAMP""",
+                """INSERT INTO cooldowns (user_id, last_open)
+                   VALUES ($1, CURRENT_TIMESTAMP) ON CONFLICT (user_id) DO UPDATE
+                   SET last_open = CURRENT_TIMESTAMP""",
                 user_id,
             )
 
     # ── Ratings ───────────────────────────────────────────────────
     async def add_rating(
-        self, channel_id: int, user_id: int, score: int, comment: str
+        self, channel_id: int, user_id: int, score: int, comment: Optional[str]
     ) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO ratings (channel_id, user_id, score, comment)
-                   VALUES ($1, $2, $3, $4)
-                   ON CONFLICT(channel_id) DO NOTHING""",
+                   VALUES ($1, $2, $3, $4) ON CONFLICT (channel_id) DO UPDATE
+                   SET score = $3, comment = $4, rated_at = CURRENT_TIMESTAMP""",
                 channel_id, user_id, score, comment,
             )
 
-    # ── Notes ─────────────────────────────────────────────────────
-    async def add_note(self, channel_id: int, staff_id: int, note: str) -> None:
+    # ── Staff Stats ───────────────────────────────────────────────
+    async def bump_stat(self, staff_id: int, closed: bool = False, claimed: bool = False) -> None:
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO ticket_notes (channel_id, staff_id, note) VALUES ($1, $2, $3)",
-                channel_id, staff_id, note,
-            )
-
-    async def get_notes(self, channel_id: int) -> list[asyncpg.Record]:
-        async with self._pool.acquire() as conn:
-            return await conn.fetch(
-                "SELECT * FROM ticket_notes WHERE channel_id = $1 ORDER BY created_at ASC",
-                channel_id,
-            )
-
-    # ── Stats ─────────────────────────────────────────────────────
-    async def bump_stat(
-        self, staff_id: int, claimed: bool = False, closed: bool = False
-    ) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO ticket_stats (staff_id) VALUES ($1) ON CONFLICT (staff_id) DO NOTHING",
-                staff_id,
-            )
-            if claimed:
-                await conn.execute(
-                    "UPDATE ticket_stats SET claimed_count = claimed_count + 1 WHERE staff_id = $1",
-                    staff_id,
-                )
             if closed:
                 await conn.execute(
-                    "UPDATE ticket_stats SET closed_count = closed_count + 1 WHERE staff_id = $1",
+                    """INSERT INTO ticket_stats (staff_id, closed_count)
+                       VALUES ($1, 1) ON CONFLICT (staff_id) DO UPDATE
+                       SET closed_count = ticket_stats.closed_count + 1""",
+                    staff_id,
+                )
+            if claimed:
+                await conn.execute(
+                    """INSERT INTO ticket_stats (staff_id, claimed_count)
+                       VALUES ($1, 1) ON CONFLICT (staff_id) DO UPDATE
+                       SET claimed_count = ticket_stats.claimed_count + 1""",
                     staff_id,
                 )
 
@@ -861,144 +844,121 @@ async def _finalize_ticket(
         await db.update_ticket_status(
             channel.id,
             TicketStatus.CLOSED,
-            closed_by=closer.id,
-            close_reason=reason,
+            closer.id,
+            reason,
         )
-    except Exception:
-        log.exception("Errore aggiornamento stato ticket %d", channel.id)
-        return  # Non eliminare il canale se il DB ha fallito
+        _open_ticket_channels.discard(channel.id)
 
-    _close_tasks.pop(channel.id, None)
-    _open_ticket_channels.discard(channel.id)
+        # Invia transcript nel canale di log
+        log_channel = channel.guild.get_channel(cfg.LOG_CHANNEL_ID)
+        if isinstance(log_channel, discord.TextChannel):
+            notes = await db.get_ticket_notes(channel.id)
+            log_embed = embed_transcript_log(channel, ticket, notes)
 
-    if isinstance(closer, discord.Member) and is_ticket_staff(closer, ticket["categoria"]):
-        with contextlib.suppress(Exception):
+            if HAS_CHAT_EXPORTER:
+                transcript_file = await chat_exporter.export(
+                    channel,
+                    limit=None,
+                    tz_info="Europe/Rome",
+                    guild=channel.guild,
+                    bot=channel.guild.me,
+                )
+                if transcript_file:
+                    await log_channel.send(
+                        embed=log_embed,
+                        file=discord.File(
+                            transcript_file, filename=f"transcript-{channel.id}.html"
+                        ),
+                    )
+                else:
+                    log.warning("Impossibile generare transcript HTML per %s", channel.name)
+                    await log_channel.send(
+                        embed=log_embed,
+                        content="⚠️ Impossibile generare transcript HTML."
+                    )
+            else:
+                log.warning("chat_exporter non installato. Transcript testuale.")
+                # Fallback testuale se chat_exporter non è disponibile
+                messages = [f"[{m.created_at.strftime('%Y-%m-%d %H:%M:%S')}] {m.author}: {m.content}" async for m in channel.history(limit=None)]
+                transcript_text = "\n".join(messages)
+                transcript_file = io.BytesIO(transcript_text.encode('utf-8'))
+                await log_channel.send(
+                    embed=log_embed,
+                    file=discord.File(transcript_file, filename=f"transcript-{channel.id}.txt"),
+                    content="⚠️ chat_exporter non installato. Transcript testuale."
+                )
+        else:
+            log.warning("Canale di log non trovato o non è un TextChannel.")
+
+        # Invia richiesta di rating all'utente
+        ticket_owner = channel.guild.get_member(ticket["user_id"])
+        if ticket_owner:
+            try:
+                await ticket_owner.send(
+                    embed=embed_rating_request(), view=RatingView(channel.id)
+                )
+            except discord.Forbidden:
+                log.warning("Impossibile inviare DM a %s per il rating.", ticket_owner)
+
+        # Aggiorna statistiche staff
+        if closer:
             await db.bump_stat(closer.id, closed=True)
 
-    await _send_transcript(db, channel, ticket)
+        # Elimina canale
+        await channel.delete(reason=f"Ticket chiuso da {closer} (ID: {closer.id})")
+        log.info("Ticket chiuso e canale eliminato: #%s da %s", channel.name, closer)
 
-    # Invia richiesta valutazione in DM
-    target = channel.guild.get_member(ticket["user_id"])
-    if target:
-        with contextlib.suppress(discord.Forbidden, discord.HTTPException):
-            await target.send(
-                embed=embed_rating_request(),
-                view=RatingView(db, channel.id, target.id),
-            )
-
-    # BUG FIX: attendi un momento prima di eliminare per permettere al messaggio
-    # di transcript di essere inviato al canale log
-    await asyncio.sleep(2)
-    with contextlib.suppress(discord.NotFound, discord.HTTPException):
-        await channel.delete(reason=f"Ticket chiuso da {closer}")
-
-
-async def _send_transcript(
-    db: Database,
-    channel: discord.TextChannel,
-    ticket_data: dict,
-) -> None:
-    if cfg.LOG_CHANNEL_ID == 0:
-        return
-
-    log_ch = channel.guild.get_channel(cfg.LOG_CHANNEL_ID)
-    if not isinstance(log_ch, discord.TextChannel):
-        return
-
-    notes = await db.get_notes(channel.id)
-    base_embed = embed_transcript_log(channel, ticket_data, notes)
-
-    if HAS_CHAT_EXPORTER:
-        try:
-            transcript = await chat_exporter.export(channel)
-            if transcript:
-                await db.save_transcript(channel.id, transcript.encode("utf-8"))
-                file = discord.File(
-                    io.BytesIO(transcript.encode("utf-8")),
-                    filename=f"transcript-{channel.name}.html",
-                )
-                with contextlib.suppress(discord.HTTPException):
-                    await log_ch.send(embed=base_embed, file=file)
-                return
-        except Exception:
-            log.exception("chat_exporter fallito per #%s, uso fallback testuale", channel.name)
-
-    # Fallback: invia solo l'embed senza file HTML
-    with contextlib.suppress(discord.HTTPException):
-        await log_ch.send(embed=base_embed)
+    except asyncpg.exceptions.PostgresError as e:
+        log.error("Errore DB durante _finalize_ticket per %s: %s", channel.name, e)
+        with contextlib.suppress(discord.HTTPException):
+            await channel.send("❌ Errore interno durante la chiusura del ticket. Riprova.")
+    except discord.NotFound:
+        log.warning("Canale %d non trovato durante la chiusura.", channel.id)
+    except Exception:
+        log.exception("Errore inaspettato durante _finalize_ticket per %s", channel.name)
 
 
 # ══════════════════════════════════════════════════════════════════
-# VIEWS & MODALS
+# VIEWS
 # ══════════════════════════════════════════════════════════════════
 
 class MainPersistentView(discord.ui.View):
+    """View persistente per il pannello di apertura ticket."""
+
     def __init__(self) -> None:
         super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="Apri un Ticket",
-        style=discord.ButtonStyle.primary,
-        emoji="🎫",
-        custom_id="persistent:open_ticket",
-    )
-    async def open_ticket(
-        self, interaction: discord.Interaction, _: discord.ui.Button
-    ) -> None:
-        e = discord.Embed(
-            title="📂  Seleziona una Categoria",
-            description=(
-                "Scegli la categoria più adatta alla tua richiesta.\n"
-                "Poi clicca **Apri Ticket →** per procedere."
-            ),
-            color=discord.Color(0x5865F2),
-        )
-        e.set_footer(text="Puoi avere al massimo 2 ticket aperti contemporaneamente.")
-        await interaction.response.send_message(
-            embed=e, view=CategorySelectView(), ephemeral=True
-        )
-
-
-class CategorySelectView(discord.ui.View):
-    def __init__(self) -> None:
-        super().__init__(timeout=120)
         self._categoria: Optional[str] = None
 
     @discord.ui.select(
-        placeholder="📁  Scegli la categoria...",
+        placeholder="Seleziona una categoria...",
+        min_values=1,
+        max_values=1,
         options=[
-            discord.SelectOption(
-                label=c,
-                value=c,
-                emoji=CATEGORIA_STYLE[c]["emoji"],
-                description={
-                    "Supporto Tecnico":  "Problemi tecnici o in-game",
-                    "Report Utente":     "Segnala un comportamento scorretto",
-                    "Candidatura Staff": "Vuoi entrare nello staff?",
-                    "Unisciti al Team":  "Partnership o collaborazioni",
-                    "Altro":             "Qualsiasi altra richiesta",
-                }[c],
-            )
-            for c in cfg.CATEGORIE
+            discord.SelectOption(label="Supporto Tecnico",  emoji="🔧", value="Supporto Tecnico"),
+            discord.SelectOption(label="Report Utente",     emoji="🚨", value="Report Utente"),
+            discord.SelectOption(label="Candidatura Staff", emoji="📄", value="Candidatura Staff"),
+            discord.SelectOption(label="Unisciti al Team",  emoji="🤝", value="Unisciti al Team"),
+            discord.SelectOption(label="Altro",             emoji="💬", value="Altro"),
         ],
-        custom_id="cat_select",
+        custom_id="persistent:category_select",
     )
-    async def select_cat(
+    async def select_category(
         self, interaction: discord.Interaction, select: discord.ui.Select
     ) -> None:
         self._categoria = select.values[0]
-        for opt in select.options:
-            opt.default = opt.value == self._categoria
-
-        e = discord.Embed(
-            title=f"{cat_emoji(self._categoria)}  Categoria: {self._categoria}",
-            description="Ottima scelta! Clicca **Apri Ticket →** per compilare il modulo.",
-            color=discord.Color(cat_color(self._categoria)),
+        await interaction.response.send_message(
+            f"Hai selezionato: **{self._categoria}**. Clicca 'Apri Ticket' per continuare.",
+            ephemeral=True,
         )
-        await interaction.response.edit_message(embed=e, view=self)
 
-    @discord.ui.button(label="Apri Ticket →", style=discord.ButtonStyle.green)
-    async def confirm(
+    @discord.ui.button(
+        label="Apri Ticket",
+        style=discord.ButtonStyle.primary,
+        emoji="➕",
+        custom_id="persistent:open_ticket",
+        row=1,
+    )
+    async def open_ticket_button(
         self, interaction: discord.Interaction, _: discord.ui.Button
     ) -> None:
         if not self._categoria:
@@ -1244,6 +1204,14 @@ class TicketControlView(discord.ui.View):
     ) -> None:
         db: Database = interaction.client.db
         ticket = await db.get_ticket(interaction.channel_id)
+        if not ticket:
+            return await interaction.response.send_message(
+                "❌ Questo canale non è un ticket.", ephemeral=True
+            )
+        if not is_ticket_staff(interaction.user, ticket["categoria"]):
+            return await interaction.response.send_message(
+                "🔒 Solo lo staff può riaprire un ticket.", ephemeral=True
+            )
         if ticket["status"] == TicketStatus.OPEN.value:
             return await interaction.response.send_message(
                 "⚠️ Il ticket è già aperto.", ephemeral=True
@@ -1354,148 +1322,178 @@ class AddNoteModal(discord.ui.Modal, title="📝  Aggiungi Nota Interna"):
         style=discord.TextStyle.long,
         min_length=1,
         max_length=500,
-        placeholder="Scrivi qui le tue osservazioni interne...",
+        placeholder="Scrivi qui le tue note interne...",
     )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.client.db.add_note(
+        db: Database = interaction.client.db
+        if not interaction.channel_id:
+            return await interaction.response.send_message(
+                "❌ Questo comando può essere usato solo in un canale ticket.",
+                ephemeral=True,
+            )
+        await db.add_ticket_note(
             interaction.channel_id, interaction.user.id, self.note.value
         )
-        e = discord.Embed(
-            title="📝  Nota Aggiunta",
-            description=f"> {self.note.value}",
-            color=discord.Color(0x99AAB5),
-            timestamp=utcnow(),
+        await interaction.response.send_message(
+            "✅ Nota aggiunta con successo.", ephemeral=True
         )
-        e.set_footer(text=f"Nota di {interaction.user.display_name} · solo staff")
-        await interaction.response.send_message(embed=e, ephemeral=True)
 
 
 class AddUserModal(discord.ui.Modal, title="➕  Aggiungi Utente al Ticket"):
     user_id_input = discord.ui.TextInput(
-        label="ID Discord dell'utente",
-        min_length=17,
-        max_length=20,
-        placeholder="Es. 123456789012345678",
+        label="ID Utente o Menziona Utente",
+        placeholder="Es. 123456789012345678 o @Utente",
+        min_length=1,
+        max_length=50,
     )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target_id_str = self.user_id_input.value.strip()
+        target_id: Optional[int] = None
+
+        # Tenta di estrarre l'ID da una menzione
+        match = re.match(r"<@!?(\d+)>", target_id_str)
+        if match:
+            target_id = int(match.group(1))
+        else:
+            # Tenta di convertire direttamente in ID
+            try:
+                target_id = int(target_id_str)
+            except ValueError:
+                pass
+
+        if not target_id:
+            return await interaction.followup.send(
+                "❌ Formato ID utente non valido. Inserisci un ID numerico o una menzione.",
+                ephemeral=True,
+            )
+
+        target_member = interaction.guild.get_member(target_id) if interaction.guild else None
+        if not target_member:
+            return await interaction.followup.send(
+                "❌ Utente non trovato nel server.", ephemeral=True
+            )
+
+        if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.followup.send(
+                "❌ Questo comando può essere usato solo in un canale ticket.",
+                ephemeral=True,
+            )
+
         try:
-            uid = int(self.user_id_input.value)
-            member = (
-                interaction.guild.get_member(uid)
-                or await interaction.guild.fetch_member(uid)
-            )
             await interaction.channel.set_permissions(
-                member,
-                view_channel=True,
-                send_messages=True,
-                attach_files=True,
-                read_message_history=True,
+                target_member,
+                view_channel=True, send_messages=True,
+                attach_files=True, read_message_history=True,
             )
-            e = discord.Embed(
-                title="➕  Utente Aggiunto",
-                description=f"{member.mention} può ora accedere a questo ticket.",
-                color=discord.Color(0x57F287),
-                timestamp=utcnow(),
-            )
-            await interaction.followup.send(embed=e)
-        except ValueError:
             await interaction.followup.send(
-                "❌ ID non valido. Deve essere un numero intero.", ephemeral=True
+                f"✅ {target_member.mention} è stato aggiunto al ticket."
             )
-        except discord.NotFound:
+            await interaction.channel.send(
+                f"Benvenuto {target_member.mention}! Sei stato aggiunto a questo ticket."
+            )
+        except discord.Forbidden:
             await interaction.followup.send(
-                "❌ Utente non trovato nel server. Controlla l'ID.", ephemeral=True
+                "❌ Non ho i permessi per aggiungere questo utente al canale.",
+                ephemeral=True,
             )
         except Exception:
-            log.exception("Errore in AddUserModal")
+            log.exception("Errore durante l'aggiunta utente al ticket.")
             await interaction.followup.send(
-                "❌ Errore inatteso. Riprova.", ephemeral=True
+                "❌ Si è verificato un errore inatteso durante l'aggiunta dell'utente.",
+                ephemeral=True,
             )
 
 
 class PriorityView(discord.ui.View):
     def __init__(self, channel_id: int) -> None:
-        super().__init__(timeout=60)
+        super().__init__(timeout=180)
         self.channel_id = channel_id
 
     @discord.ui.select(
         placeholder="Seleziona la priorità...",
+        min_values=1,
+        max_values=1,
         options=[
-            discord.SelectOption(
-                label=p.value,
-                value=p.name,
-                emoji=p.icon,
-                description=f"Livello {p.rank + 1}/4  |  {p.bar}",
-            )
-            for p in Priority
+            discord.SelectOption(label="Urgente", emoji=Priority.URGENT.icon, value=Priority.URGENT.value),
+            discord.SelectOption(label="Alta",    emoji=Priority.HIGH.icon,   value=Priority.HIGH.value),
+            discord.SelectOption(label="Media",   emoji=Priority.MEDIUM.icon, value=Priority.MEDIUM.value),
+            discord.SelectOption(label="Bassa",   emoji=Priority.LOW.icon,    value=Priority.LOW.value),
         ],
     )
     async def select_priority(
         self, interaction: discord.Interaction, select: discord.ui.Select
     ) -> None:
-        p = Priority[select.values[0]]
-        await interaction.client.db.set_priority(self.channel_id, p)
-        if not isinstance(interaction.user, discord.Member):
-            return
-        await interaction.response.edit_message(
-            content=None,
-            embed=embed_priority_updated(p, interaction.user),
-            view=None,
+        db: Database = interaction.client.db
+        new_priority = Priority(select.values[0])
+        await db.set_priority(self.channel_id, new_priority)
+        await interaction.response.send_message(
+            embed=embed_priority_updated(new_priority, interaction.user),
         )
 
 
 _STAR_LABELS = {
-    5: "Eccellente 🌟",
-    4: "Ottimo 👍",
-    3: "Nella media 😐",
-    2: "Da migliorare 😕",
-    1: "Scadente 👎",
+    1: "⭐☆☆☆☆ (Pessimo)",
+    2: "⭐⭐☆☆☆ (Scarso)",
+    3: "⭐⭐⭐☆☆ (Neutro)",
+    4: "⭐⭐⭐⭐☆ (Buono)",
+    5: "⭐⭐⭐⭐⭐ (Eccellente)",
 }
 
 class RatingView(discord.ui.View):
-    """
-    BUG FIX: La view viene inviata in DM e non deve essere persistente
-    (non ha custom_id statici). Il timeout di 300s è corretto per un DM.
-    """
-
-    def __init__(self, db: Database, channel_id: int, user_id: int) -> None:
-        super().__init__(timeout=300)
-        self.db         = db
+    def __init__(self, channel_id: int) -> None:
+        super().__init__(timeout=600)  # 10 minuti per votare
         self.channel_id = channel_id
-        self.user_id    = user_id
 
     @discord.ui.select(
-        placeholder="⭐  Seleziona il tuo voto...",
+        placeholder="Valuta il supporto ricevuto...",
+        min_values=1,
+        max_values=1,
         options=[
-            discord.SelectOption(
-                label=f"{'⭐' * i}  {_STAR_LABELS[i]}",
-                value=str(i),
-            )
-            for i in range(5, 0, -1)
+            discord.SelectOption(label=_STAR_LABELS[5], value="5"),
+            discord.SelectOption(label=_STAR_LABELS[4], value="4"),
+            discord.SelectOption(label=_STAR_LABELS[3], value="3"),
+            discord.SelectOption(label=_STAR_LABELS[2], value="2"),
+            discord.SelectOption(label=_STAR_LABELS[1], value="1"),
         ],
     )
     async def select_rating(
         self, interaction: discord.Interaction, select: discord.ui.Select
     ) -> None:
+        db: Database = interaction.client.db
         score = int(select.values[0])
-        await self.db.add_rating(self.channel_id, self.user_id, score, "")
-        stars = "⭐" * score
-        e = discord.Embed(
-            title="✅  Grazie per il tuo feedback!",
-            description=f"Hai valutato il supporto **{score}/5** {stars}\n*{_STAR_LABELS[score]}*",
-            color=discord.Color(0xFEE75C),
-            timestamp=utcnow(),
-        )
-        e.set_footer(text="Il tuo feedback è stato registrato.")
-        await interaction.response.edit_message(embed=e, view=None)
-        self.stop()
+
+        # Chiedi un commento opzionale
+        class CommentModal(discord.ui.Modal, title="💬  Lascia un commento (Opzionale)"):
+            comment = discord.ui.TextInput(
+                label="Il tuo feedback (opzionale)",
+                style=discord.TextStyle.long,
+                required=False,
+                max_length=500,
+                placeholder="Cosa potremmo migliorare o cosa ti è piaciuto?",
+            )
+
+            async def on_submit(self, modal_interaction: discord.Interaction) -> None:
+                await db.add_rating(
+                    self.view.channel_id, modal_interaction.user.id, score, self.comment.value or None
+                )
+                await modal_interaction.response.send_message(
+                    f"✅ Grazie per aver valutato il ticket con {score} stelle!",
+                    ephemeral=True,
+                )
+                self.view.stop() # Ferma la view dopo il submit
+
+        comment_modal = CommentModal()
+        comment_modal.view = self # Passa la view al modal per fermarla dopo
+        await interaction.response.send_modal(comment_modal)
 
     async def on_timeout(self) -> None:
-        # Non c'è nulla da fare — la view scade silenziosamente
-        pass
+        # Disabilita i componenti se il timeout scade
+        for item in self.children:
+            item.disabled = True
+        # Non inviare un messaggio di timeout, è un DM
 
 
 # ══════════════════════════════════════════════════════════════════
