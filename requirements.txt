@@ -1,3 +1,4 @@
 discord.py>=2.3.0
-aiosqlite
+asyncpg
 chat-exporter
+
