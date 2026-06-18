@@ -1,22 +1,26 @@
 """
 TicketBot v3 – Bot ticket professionale per Discord (PostgreSQL / Railway)
 =========================================================================
-CHANGELOG v3:
-- FIX CRITICO: TicketModal ora costruisce i TextInput dinamicamente dentro __init__
-  invece che come attributi di classe, eliminando il conflitto titolo/campi che
-  causava "This interaction failed" quando si selezionava la categoria.
-- FIX CRITICO: on_submit usa try/except granulare con logging dettagliato per
-  ciascuna fase (validazione, creazione canale, DB, invio embed) così l'errore
-  esatto appare sempre nei log invece di essere inghiottito silenziosamente.
-- FIX: interaction.response già consumata dal defer → tutti i followup usano
-  interaction.followup.send, mai interaction.response.send_message dopo il defer.
-- FIX: RatingView.channel_id viene recuperato dal DB tramite interaction.message
-  al riavvio (il channel_id=0 del placeholder non viene più usato per salvare).
-- FIX: PriorityView.select_priority ora risponde con send_message ephemeral
-  invece di channel send per non inquinare la chat del ticket.
-- MIGLIORAMENTO: tutti gli errori loggano il traceback completo con log.exception.
-- MIGLIORAMENTO: safe_channel_name tronca meglio i nomi lunghi con categoria.
-- MIGLIORAMENTO: aggiunto comando /ticket_info per vedere info ticket nel canale.
+CHANGELOG v3.1 (FIX CRITICO eliminazione canale):
+- FIX: _finalize ora suddivide ogni fase in un try/except indipendente.
+  Nel codice precedente, se log/export/DM sollevava un'eccezione, il flusso
+  saltava all'except principale e channel.delete() non veniva mai eseguito.
+- FIX: closer_id viene salvato subito come int prima di qualsiasi await,
+  così l'oggetto Member non può diventare stale durante l'attesa dei 10 minuti.
+- FIX: channel.delete() ha ora il suo try/except granulare con gestione
+  esplicita di NotFound, Forbidden e HTTPException.
+- MIGLIORAMENTO: log/transcript e DM rating sono "non bloccanti": un errore
+  in queste fasi viene loggato ma NON impedisce la cancellazione del canale.
+
+CHANGELOG v3 originale:
+- FIX CRITICO: TicketModal costruisce i TextInput dinamicamente in __init__
+- FIX CRITICO: on_submit usa try/except granulare con logging dettagliato
+- FIX: interaction.response già consumata dal defer → followup.send
+- FIX: RatingView.channel_id recuperato dal DB al riavvio
+- FIX: PriorityView.select_priority risponde ephemeral
+- MIGLIORAMENTO: tutti gli errori loggano traceback completo con log.exception
+- MIGLIORAMENTO: safe_channel_name tronca meglio i nomi lunghi
+- AGGIUNTO: comando /ticket_info per vedere info ticket nel canale
 """
 
 from __future__ import annotations
@@ -422,7 +426,7 @@ class Database:
 # STATO GLOBALE
 # ══════════════════════════════════════════════════════════════════
 _close_tasks: dict[int, asyncio.Task] = {}
-_open_channels: set[int] = set()   # cache dei channel_id ticket aperti
+_open_channels: set[int] = set()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -637,14 +641,28 @@ async def _finalize(db: Database, channel: discord.TextChannel,
     if not ticket or ticket["status"] not in (TicketStatus.CLOSING.value, TicketStatus.OPEN.value):
         return
 
-    try:
-        await db.update_status(channel.id, TicketStatus.CLOSED, closer.id, reason)
-        _open_channels.discard(channel.id)
+    # Salva subito l'ID come int prima di qualsiasi await:
+    # l'oggetto Member può diventare stale dopo i 10 minuti di attesa.
+    closer_id = closer.id
 
+    # ── 1. Aggiorna DB e cache ────────────────────────────────────
+    # Se questa fase fallisce, non ha senso proseguire (dati inconsistenti).
+    try:
+        await db.update_status(channel.id, TicketStatus.CLOSED, closer_id, reason)
+        _open_channels.discard(channel.id)
+    except asyncpg.exceptions.PostgresError:
+        log.exception("Errore DB update_status in _finalize (canale %s)", channel.name)
+        with contextlib.suppress(discord.HTTPException):
+            await channel.send("❌ Errore DB durante la chiusura. Riprova.")
+        return
+
+    # ── 2. Log + transcript ───────────────────────────────────────
+    # NON bloccante: un errore qui non impedisce la cancellazione del canale.
+    try:
         log_ch = channel.guild.get_channel(cfg.LOG_CHANNEL_ID)
         if isinstance(log_ch, discord.TextChannel):
-            notes    = await db.get_notes(channel.id)
-            log_emb  = embed_log(channel, ticket, notes)
+            notes   = await db.get_notes(channel.id)
+            log_emb = embed_log(channel, ticket, notes)
 
             if HAS_CHAT_EXPORTER:
                 export = await chat_exporter.export(
@@ -652,8 +670,10 @@ async def _finalize(db: Database, channel: discord.TextChannel,
                     guild=channel.guild, bot=channel.guild.me,
                 )
                 if export:
-                    await log_ch.send(embed=log_emb,
-                                      file=discord.File(export, f"transcript-{channel.id}.html"))
+                    await log_ch.send(
+                        embed=log_emb,
+                        file=discord.File(export, f"transcript-{channel.id}.html"),
+                    )
                 else:
                     await log_ch.send(embed=log_emb, content="⚠️ Export HTML fallito.")
             else:
@@ -662,28 +682,53 @@ async def _finalize(db: Database, channel: discord.TextChannel,
                     async for m in channel.history(limit=None, oldest_first=True)
                 ]
                 buf = io.BytesIO("\n".join(msgs).encode())
-                await log_ch.send(embed=log_emb,
-                                   file=discord.File(buf, f"transcript-{channel.id}.txt"))
+                await log_ch.send(
+                    embed=log_emb,
+                    file=discord.File(buf, f"transcript-{channel.id}.txt"),
+                )
         else:
             log.warning("Canale log non trovato (ID %d)", cfg.LOG_CHANNEL_ID)
+    except Exception:
+        log.exception("Errore log/transcript (canale %s) — la chiusura continua", channel.name)
+        # NON fare return: la cancellazione del canale deve avvenire comunque
 
+    # ── 3. DM rating all'utente ───────────────────────────────────
+    # NON bloccante: se l'utente ha i DM chiusi o ha lasciato il server, proseguiamo.
+    try:
         owner = channel.guild.get_member(ticket["user_id"])
         if owner:
             with contextlib.suppress(discord.Forbidden):
                 await owner.send(embed=embed_rating_dm(), view=RatingView(channel.id))
-
-        await db.bump_closed(closer.id)
-        await channel.delete(reason=f"Ticket chiuso da {closer}")
-        log.info("Ticket #%s chiuso da %s", channel.name, closer)
-
-    except asyncpg.exceptions.PostgresError:
-        log.exception("Errore DB in _finalize (canale %s)", channel.name)
-        with contextlib.suppress(discord.HTTPException):
-            await channel.send("❌ Errore DB durante la chiusura. Riprova.")
-    except discord.NotFound:
-        log.warning("Canale %d già eliminato.", channel.id)
     except Exception:
-        log.exception("Errore inatteso in _finalize (canale %s)", channel.name)
+        log.exception("Errore DM rating (canale %s) — la chiusura continua", channel.name)
+
+    # ── 4. Statistiche staff ──────────────────────────────────────
+    # NON bloccante.
+    try:
+        await db.bump_closed(closer_id)
+    except Exception:
+        log.exception("Errore bump_closed staff_id=%d — la chiusura continua", closer_id)
+
+    # ── 5. ELIMINA IL CANALE ──────────────────────────────────────
+    # Questa fase è indipendente da tutto il resto e ha il suo try/except dedicato.
+    # È la fase più importante: deve avvenire sempre.
+    try:
+        await channel.delete(reason=f"Ticket chiuso da closer_id={closer_id}")
+        log.info("Ticket #%s eliminato correttamente (closer_id=%d).", channel.name, closer_id)
+    except discord.NotFound:
+        # Il canale è già stato eliminato manualmente: non è un errore.
+        log.warning("Canale %d già eliminato manualmente, nessun problema.", channel.id)
+    except discord.Forbidden:
+        log.error("Permessi insufficienti per eliminare il canale %d.", channel.id)
+        with contextlib.suppress(discord.HTTPException):
+            await channel.send(
+                "❌ Non ho i permessi per eliminare questo canale. "
+                "Contatta un amministratore."
+            )
+    except discord.HTTPException as ex:
+        log.exception("HTTPException eliminando canale %d: %s", channel.id, ex)
+    except Exception:
+        log.exception("Errore inatteso eliminando canale %d", channel.id)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -691,11 +736,6 @@ async def _finalize(db: Database, channel: discord.TextChannel,
 # ══════════════════════════════════════════════════════════════════
 
 class MainPersistentView(discord.ui.View):
-    """
-    Pannello principale nel canale pubblico.
-    Il SelectMenu apre DIRETTAMENTE il Modal – nessuno stato interno,
-    nessun Button intermedio, zero possibilità di perdita della categoria.
-    """
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
@@ -719,8 +759,6 @@ class MainPersistentView(discord.ui.View):
     async def select_cat(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
         categoria = select.values[0]
         log.info("Utente %s ha selezionato categoria: %s", interaction.user, categoria)
-        # FIX CRITICO v3: inviamo il Modal direttamente nella risposta all'interazione
-        # del SelectMenu. Questo è l'unico modo garantito per aprire un Modal da un Select.
         try:
             await interaction.response.send_modal(TicketModal(categoria))
         except Exception:
@@ -734,14 +772,6 @@ class MainPersistentView(discord.ui.View):
 
 
 class TicketModal(discord.ui.Modal):
-    """
-    FIX CRITICO v3: i TextInput sono creati dinamicamente in __init__ con self.add_item().
-    Definirli come attributi di classe su una Modal con titolo dinamico causa un conflitto
-    interno in discord.py che si manifesta come 'This interaction failed' sul client Discord.
-    Con add_item() i campi vengono registrati DOPO che il titolo è già impostato,
-    garantendo che il Modal sia sempre in uno stato valido prima dell'invio.
-    """
-
     def __init__(self, categoria: str) -> None:
         super().__init__(title=f"{cat_emoji(categoria)} Ticket — {categoria}", timeout=300)
         self.categoria = categoria
@@ -775,7 +805,6 @@ class TicketModal(discord.ui.Modal):
         self.add_item(self.desc)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        # Deferrare subito per avere 15 minuti di tempo e non scadere
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         db: Database  = interaction.client.db
@@ -783,11 +812,9 @@ class TicketModal(discord.ui.Modal):
         guild         = interaction.guild
 
         async def reply(msg: str) -> None:
-            """Helper per rispondere dopo il defer."""
             with contextlib.suppress(discord.HTTPException):
                 await interaction.followup.send(msg, ephemeral=True)
 
-        # ── Validazioni ───────────────────────────────────────────
         if not guild:
             return await reply("❌ Disponibile solo nei server Discord.")
 
@@ -819,13 +846,11 @@ class TicketModal(discord.ui.Modal):
             log.exception("Errore DB count_open per %s", user)
             return await reply("❌ Errore interno. Riprova tra poco.")
 
-        # ── Verifica categoria Discord ────────────────────────────
         cat_ch = guild.get_channel(cfg.CATEGORY_GENERAL)
         if not isinstance(cat_ch, discord.CategoryChannel):
             log.error("CATEGORY_GENERAL %d non trovato o non è CategoryChannel", cfg.CATEGORY_GENERAL)
             return await reply("❌ Configurazione errata: categoria canali non trovata. Contatta un admin.")
 
-        # ── Permessi canale ───────────────────────────────────────
         staff_perms = discord.PermissionOverwrite(
             view_channel=True, send_messages=True, attach_files=True, manage_messages=True)
         admin_perms = discord.PermissionOverwrite(
@@ -852,7 +877,6 @@ class TicketModal(discord.ui.Modal):
 
         ch_name = safe_channel_name(user.name, self.categoria)
 
-        # ── Creazione canale ──────────────────────────────────────
         try:
             channel = await guild.create_text_channel(
                 ch_name,
@@ -872,19 +896,16 @@ class TicketModal(discord.ui.Modal):
             log.exception("Errore inatteso creando canale per %s", user)
             return await reply("❌ Errore inatteso. Riprova tra poco.")
 
-        # ── Salva su DB ───────────────────────────────────────────
         try:
             await db.create_ticket(channel.id, user.id, self.categoria, mc_val, subj_val, desc_val)
             await db.update_cooldown(user.id)
             _open_channels.add(channel.id)
         except Exception:
             log.exception("Errore DB dopo creazione canale %d", channel.id)
-            # Canale creato ma DB fallito: elimina per coerenza
             with contextlib.suppress(Exception):
                 await channel.delete(reason="Rollback: errore DB post-creazione")
             return await reply("❌ Errore DB durante la creazione del ticket. Riprova.")
 
-        # ── Invia messaggio nel canale ticket ─────────────────────
         mentions = " ".join(filter(None, [
             staff_role.mention if staff_role else None,
             cat_role.mention if cat_role and cat_role != staff_role else None,
@@ -898,7 +919,6 @@ class TicketModal(discord.ui.Modal):
         except Exception:
             log.exception("Errore inviando embed nel canale ticket %d", channel.id)
 
-        # ── Conferma all'utente ───────────────────────────────────
         e = discord.Embed(
             title="✅  Ticket aperto!",
             description=f"Il tuo ticket è in {channel.mention}.\nLo staff ti risponderà al più presto.",
@@ -917,8 +937,6 @@ class TicketModal(discord.ui.Modal):
 
 
 class TicketControlView(discord.ui.View):
-    """Pannello di controllo dentro il canale ticket. Tutti i bottoni sono persistenti."""
-
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
@@ -1069,13 +1087,6 @@ _STARS = {1: "⭐☆☆☆☆", 2: "⭐⭐☆☆☆", 3: "⭐⭐⭐☆☆", 4: "
 
 
 class RatingView(discord.ui.View):
-    """
-    View inviata via DM dopo la chiusura del ticket.
-    timeout=None + custom_id persistente → sopravvive ai riavvii.
-    channel_id=0 è usato come placeholder per add_view(); al submit
-    il channel_id reale viene recuperato dall'interaction.message se presente,
-    altrimenti viene saltato il salvataggio (non critico).
-    """
     def __init__(self, channel_id: int) -> None:
         super().__init__(timeout=None)
         self.channel_id = channel_id
@@ -1282,10 +1293,9 @@ class TicketBot(commands.Bot):
         _open_channels = await self.db.load_open_ids()
         log.info("Cache ticket aperti: %d canali", len(_open_channels))
 
-        # Registra persistent views
         self.add_view(MainPersistentView())
         self.add_view(TicketControlView())
-        self.add_view(RatingView(channel_id=0))  # placeholder
+        self.add_view(RatingView(channel_id=0))
 
         cog = TicketCog(self)
         await self.add_cog(cog)
