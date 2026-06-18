@@ -240,7 +240,10 @@ class Database:
         self._conn: Optional[aiosqlite.Connection] = None
 
     async def connect(self) -> None:
-        self._conn = await aiosqlite.connect(self._path)
+        import pathlib
+        db_path = pathlib.Path(self._path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = await aiosqlite.connect(str(db_path))
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(_SCHEMA)
         await self._conn.commit()
