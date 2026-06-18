@@ -74,7 +74,7 @@ class Config:
     DATABASE_URL: str = field(default_factory=lambda: os.environ.get("DATABASE_URL", ""))
 
     # ── Hardcoded – modifica questi valori ────────────────────────
-    LOG_CHANNEL_ID:      int = 1517107696200061040
+    LOG_CHANNEL_ID:      int = 1517184033803604039
     CATEGORY_GENERAL:    int = 1517099911269580891
     STAFF_TICKET_ROLE_ID: int = 1499713651576406020
     ADMIN_ROLE_ID:        int = 1517123223836295188
