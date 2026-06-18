@@ -364,8 +364,7 @@ def get_category_role_id(cat_name: str) -> Optional[int]:
     return cfg.CATEGORIA_ROLES.get(cat_name)
 
 def is_ticket_staff(member: discord.Member, categoria: str) -> bool:
-    if member.guild_permissions.administrator:
-        return True
+    # L'admin è definito solo dal ruolo specifico, non dal permesso amministratore del server
     if cfg.ADMIN_ROLE_ID != 0 and any(r.id == cfg.ADMIN_ROLE_ID for r in member.roles):
         return True
     if cfg.STAFF_TICKET_ROLE_ID != 0 and any(r.id == cfg.STAFF_TICKET_ROLE_ID for r in member.roles):
@@ -717,21 +716,24 @@ class TicketCog(commands.Cog):
                 await schedule_close(self.bot.db, channel, self.bot.user, "Inattività")
 
     @app_commands.command(name="ticket_setup", description="Invia il messaggio di apertura ticket.")
-    @app_commands.checks.has_permissions(administrator=True)
     async def ticket_setup(self, interaction: discord.Interaction):
+        if not is_ticket_staff(interaction.user, "Altro"): # Controllo tramite ruolo Admin/Staff
+            return await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         embed = _ticket_embed("🎫 Supporto Ticket", "Clicca sotto per aprire un ticket.", discord.Color.blue())
         await interaction.channel.send(embed=embed, view=MainPersistentView())
         await interaction.response.send_message("✅ Setup completato.", ephemeral=True)
 
     @app_commands.command(name="blacklist_add", description="Blacklist utente.")
-    @app_commands.checks.has_permissions(manage_guild=True)
     async def blacklist_add(self, interaction: discord.Interaction, user: discord.User, reason: str = "Nessun motivo"):
+        if not is_ticket_staff(interaction.user, "Altro"):
+            return await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         await self.bot.db.blacklist_add(user.id, reason, interaction.user.id)
         await interaction.response.send_message(f"✅ {user.mention} in blacklist.")
 
     @app_commands.command(name="blacklist_remove", description="Rimuovi blacklist.")
-    @app_commands.checks.has_permissions(manage_guild=True)
     async def blacklist_remove(self, interaction: discord.Interaction, user: discord.User):
+        if not is_ticket_staff(interaction.user, "Altro"):
+            return await interaction.response.send_message("❌ Solo lo staff può usare questo comando.", ephemeral=True)
         if await self.bot.db.blacklist_remove(user.id):
             await interaction.response.send_message(f"✅ {user.mention} rimosso.")
         else:
