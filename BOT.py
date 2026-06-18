@@ -61,7 +61,7 @@ class Config:
     ADMIN_ROLE_ID: int        = 1517091767399350342   # Ruolo admin (ha tutti i permessi, come administrator)
 
     # ── Database ──────────────────────────────────────────────────
-    DATABASE_URL: str = os.environ.get("DATABASE_URL", "tickets.db")
+    DATABASE_URL: str = os.environ.get("DATABASE_URL")
 
     # ── Comportamento ─────────────────────────────────────────────
     MAX_OPEN_TICKETS: int        = 2    # Ticket aperti contemporaneamente per utente
