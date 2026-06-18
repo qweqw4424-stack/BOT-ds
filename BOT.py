@@ -71,7 +71,7 @@ class Config:
 
     # ── Hardcoded – modifica questi valori ────────────────────────
     LOG_CHANNEL_ID:      int = 1517107696200061040
-    CATEGORY_GENERAL:    int = 1517099911269580891
+    CATEGORY_GENERAL:    int = 1499713653203533869
     STAFF_TICKET_ROLE_ID: int = 1499713651576406020
     ADMIN_ROLE_ID:        int = 1517123223836295188
 
