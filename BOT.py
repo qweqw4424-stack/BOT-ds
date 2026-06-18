@@ -71,15 +71,15 @@ class Config:
 
     # ── Hardcoded – modifica questi valori ────────────────────────
     LOG_CHANNEL_ID:      int = 1517107696200061040
-    CATEGORY_GENERAL:    int = 1499713653203533869
-    STAFF_TICKET_ROLE_ID: int = 1499713651576406020
+    CATEGORY_GENERAL:    int = 1517099911269580891
+    STAFF_TICKET_ROLE_ID: int = 1517123223836295188
     ADMIN_ROLE_ID:        int = 1517123223836295188
 
     MAX_OPEN_TICKETS:        int = 2
     COOLDOWN_SECONDS:        int = 30
     AUTO_CLOSE_HOURS:        int = 48
     AUTO_CLOSE_CHECK_MINUTES: int = 30
-    CLOSE_DELAY:             int = 300   # secondi prima della chiusura definitiva
+    CLOSE_DELAY:             int = 600   # secondi prima della chiusura definitiva
 
     CATEGORIE: tuple = field(default_factory=lambda: (
         "Supporto Tecnico",
@@ -94,11 +94,11 @@ class Config:
     def __post_init__(self) -> None:
         if not self.CATEGORIA_ROLES:
             self.CATEGORIA_ROLES = {
-                "Supporto Tecnico":  1499713651576406020,
-                "Report Utente":     1499713651576406020,
-                "Candidatura Staff": 1499713651576406024,
-                "Unisciti al Team":  1499713651576406024,
-                "Altro":             1499713651576406020,
+                "Supporto Tecnico":  1517123223836295188,
+                "Report Utente":     1517123223836295188,
+                "Candidatura Staff": 1517123223836295188,
+                "Unisciti al Team":  1517123223836295188,
+                "Altro":             1517123223836295188,
             }
 
     def validate(self) -> None:
