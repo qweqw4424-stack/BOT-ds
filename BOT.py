@@ -72,7 +72,7 @@ class Config:
     # ── Hardcoded – modifica questi valori ────────────────────────
     LOG_CHANNEL_ID:      int = 1517107696200061040
     CATEGORY_GENERAL:    int = 1517099911269580891
-    STAFF_TICKET_ROLE_ID: int = 1517123223836295188
+    STAFF_TICKET_ROLE_ID: int = 1499713651576406020
     ADMIN_ROLE_ID:        int = 1517123223836295188
 
     MAX_OPEN_TICKETS:        int = 2
@@ -94,11 +94,11 @@ class Config:
     def __post_init__(self) -> None:
         if not self.CATEGORIA_ROLES:
             self.CATEGORIA_ROLES = {
-                "Supporto Tecnico":  1517123223836295188,
-                "Report Utente":     1517123223836295188,
-                "Candidatura Staff": 1517123223836295188,
-                "Unisciti al Team":  1517123223836295188,
-                "Altro":             1517123223836295188,
+                "Supporto Tecnico":  1499713651576406020,
+                "Report Utente":     1499713651576406020,
+                "Candidatura Staff": 1499713651576406024,
+                "Unisciti al Team":  1499713651576406024,
+                "Altro":             1499713651576406020,
             }
 
     def validate(self) -> None:
