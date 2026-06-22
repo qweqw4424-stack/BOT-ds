@@ -1,18 +1,16 @@
+"""
 TicketBot v3 – Bot ticket professionale per Discord (PostgreSQL / Railway)
 =========================================================================
-CHANGELOG v3.2:
-- FIX: is_staff ora parsa correttamente STAFF_TICKET_ROLE_ID e ADMIN_ROLE_ID
-  come liste di interi separati da virgola (prima confrontava int con str).
-- NUOVO: Gli admin (ADMIN_ROLE_ID) possono gestire e chiudere ticket
-  senza essere pingati all'apertura.
-- NUOVO: Comando /tickets_aperti per vedere tutti i ticket aperti (solo admin).
-- NUOVO: Config.ADMIN_ROLE_IDS e Config.STAFF_ROLE_IDS come set[int] parsati una volta sola.
-
 CHANGELOG v3.1 (FIX CRITICO eliminazione canale):
 - FIX: _finalize ora suddivide ogni fase in un try/except indipendente.
-- FIX: closer_id viene salvato subito come int prima di qualsiasi await.
-- FIX: channel.delete() ha ora il suo try/except granulare.
-- MIGLIORAMENTO: log/transcript e DM rating sono "non bloccanti".
+  Nel codice precedente, se log/export/DM sollevava un'eccezione, il flusso
+  saltava all'except principale e channel.delete() non veniva mai eseguito.
+- FIX: closer_id viene salvato subito come int prima di qualsiasi await,
+  così l'oggetto Member non può diventare stale durante l'attesa dei 10 minuti.
+- FIX: channel.delete() ha ora il suo try/except granulare con gestione
+  esplicita di NotFound, Forbidden e HTTPException.
+- MIGLIORAMENTO: log/transcript e DM rating sono "non bloccanti": un errore
+  in queste fasi viene loggato ma NON impedisce la cancellazione del canale.
 
 CHANGELOG v3 originale:
 - FIX CRITICO: TicketModal costruisce i TextInput dinamicamente in __init__
@@ -66,22 +64,6 @@ log = logging.getLogger("TicketBot")
 
 
 # ══════════════════════════════════════════════════════════════════
-# UTILITY: parsa una stringa "id1, id2, id3" in set[int]
-# ══════════════════════════════════════════════════════════════════
-def _parse_id_list(raw: str) -> set[int]:
-    """Converte '123, 456, 789' → {123, 456, 789}. Ignora token vuoti."""
-    result: set[int] = set()
-    for tok in raw.split(","):
-        tok = tok.strip()
-        if tok:
-            try:
-                result.add(int(tok))
-            except ValueError:
-                log.warning("ID non valido ignorato nella config: %r", tok)
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════
 # CONFIGURAZIONE
 # ══════════════════════════════════════════════════════════════════
 @dataclass
@@ -92,18 +74,16 @@ class Config:
     DATABASE_URL: str = field(default_factory=lambda: os.environ.get("DATABASE_URL", ""))
 
     # ── Hardcoded – modifica questi valori ────────────────────────
-    LOG_CHANNEL_ID:       int = 1517184033803604039
-    CATEGORY_GENERAL:     int = 1499713653203533869
-
-    # Stringhe con ID separati da virgola (compatibilità con v3.x)
+    LOG_CHANNEL_ID:      int = 1517184033803604039
+    CATEGORY_GENERAL:    int = 1499713653203533869
     STAFF_TICKET_ROLE_ID: str = "1499713651576406020, 1517091767399350342"
-    ADMIN_ROLE_ID:        str = "1517123223836295188, 1517091767399350342"
+    ADMIN_ROLE_ID: str = "1517123223836295188, 1517091767399350342"
 
-    MAX_OPEN_TICKETS:         int = 200
-    COOLDOWN_SECONDS:         int = 30
-    AUTO_CLOSE_HOURS:         int = 48
+    MAX_OPEN_TICKETS:        int = 200
+    COOLDOWN_SECONDS:        int = 30
+    AUTO_CLOSE_HOURS:        int = 48
     AUTO_CLOSE_CHECK_MINUTES: int = 30
-    CLOSE_DELAY:              int = 60   # secondi prima della chiusura definitiva
+    CLOSE_DELAY:             int = 60   # secondi prima della chiusura definitiva
 
     CATEGORIE: tuple = field(default_factory=lambda: (
         "Supporto Tecnico",
@@ -115,11 +95,6 @@ class Config:
 
     CATEGORIA_ROLES: dict = field(default_factory=dict)
 
-    # ── Set parsati una volta sola (popolati in __post_init__) ────
-    # NON modificare direttamente: usa STAFF_TICKET_ROLE_ID / ADMIN_ROLE_ID
-    _staff_ids: set[int] = field(default_factory=set, init=False, repr=False)
-    _admin_ids: set[int] = field(default_factory=set, init=False, repr=False)
-
     def __post_init__(self) -> None:
         if not self.CATEGORIA_ROLES:
             self.CATEGORIA_ROLES = {
@@ -129,17 +104,6 @@ class Config:
                 "Unisciti al Team":  1499713651576406024,
                 "Altro":             1499713651576406020,
             }
-        # Parsa le stringhe una volta sola
-        self._staff_ids = _parse_id_list(self.STAFF_TICKET_ROLE_ID)
-        self._admin_ids = _parse_id_list(self.ADMIN_ROLE_ID)
-
-    @property
-    def staff_ids(self) -> set[int]:
-        return self._staff_ids
-
-    @property
-    def admin_ids(self) -> set[int]:
-        return self._admin_ids
 
     def validate(self) -> None:
         errors: list[str] = []
@@ -233,31 +197,12 @@ def ensure_tz(dt: Optional[datetime.datetime]) -> Optional[datetime.datetime]:
 def get_category_role_id(cat: str) -> Optional[int]:
     return cfg.CATEGORIA_ROLES.get(cat)
 
-
-def is_admin(member: discord.Member) -> bool:
-    """Restituisce True se il membro ha almeno uno dei ruoli admin."""
-    member_role_ids = {r.id for r in member.roles}
-    return bool(cfg.admin_ids & member_role_ids)
-
-
 def is_staff(member: discord.Member, categoria: str = "Altro") -> bool:
-    """
-    Restituisce True se il membro è staff o admin.
-    FIX v3.2: confronto avviene tra set[int], non più str vs int.
-    """
-    member_role_ids = {r.id for r in member.roles}
-
-    # Admin ha sempre accesso
-    if cfg.admin_ids & member_role_ids:
-        return True
-
-    # Staff generico
-    if cfg.staff_ids & member_role_ids:
-        return True
-
-    # Ruolo specifico per categoria
+    ids = {r.id for r in member.roles}
+    if cfg.ADMIN_ROLE_ID        and cfg.ADMIN_ROLE_ID        in ids: return True
+    if cfg.STAFF_TICKET_ROLE_ID and cfg.STAFF_TICKET_ROLE_ID in ids: return True
     crid = get_category_role_id(categoria)
-    return bool(crid and crid in member_role_ids)
+    return bool(crid and crid in ids)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -393,16 +338,6 @@ class Database:
             await c.execute(
                 "UPDATE tickets SET status='open',closed_by=NULL,closed_at=NULL,"
                 "close_reason=NULL WHERE channel_id=$1", channel_id)
-
-    async def get_all_open(self) -> list[asyncpg.Record]:
-        """Restituisce tutti i ticket con status open o closing."""
-        async with self._pool.acquire() as c:
-            return await c.fetch(
-                "SELECT channel_id, user_id, categoria, priority, status, subject, "
-                "mc_name, claimed_by, opened_at "
-                "FROM tickets WHERE status IN ('open','closing') "
-                "ORDER BY opened_at ASC"
-            )
 
     # ── Blacklist ─────────────────────────────────────────────────
     async def is_blacklisted(self, user_id: int) -> bool:
@@ -661,51 +596,6 @@ def embed_blacklist(rows: list) -> discord.Embed:
                           color=discord.Color(0xED4245), timestamp=utcnow())
 
 
-def embed_all_open(rows: list, guild: discord.Guild) -> list[discord.Embed]:
-    """
-    Costruisce una lista di embed per tutti i ticket aperti.
-    Suddivide in pagine da 10 ticket per rispettare i limiti Discord.
-    """
-    PAGE_SIZE = 10
-    pages: list[discord.Embed] = []
-
-    total = len(rows)
-    chunks = [rows[i:i+PAGE_SIZE] for i in range(0, max(total, 1), PAGE_SIZE)]
-
-    for idx, chunk in enumerate(chunks, 1):
-        e = discord.Embed(
-            title=f"📂  Ticket Aperti — {total} totali (pag. {idx}/{len(chunks)})",
-            color=discord.Color(0x5865F2),
-            timestamp=utcnow(),
-        )
-        for row in chunk:
-            channel = guild.get_channel(row["channel_id"])
-            ch_ref  = channel.mention if channel else f"`#{row['channel_id']}`"
-            opened  = ensure_tz(row["opened_at"])
-            age     = ""
-            if opened:
-                delta = int((utcnow() - opened).total_seconds())
-                age   = f" · {format_delta(delta)} fa"
-            claimed = f" · 🙋 <@{row['claimed_by']}>" if row.get("claimed_by") else " · 🔵 Non assegnato"
-            status_icon = "🔒" if row["status"] == TicketStatus.CLOSING.value else "🟢"
-            prio_map = {"Urgente": "🚨", "Alta": "🔴", "Media": "🟡", "Bassa": "🟢"}
-            prio_icon = prio_map.get(row["priority"], "⬜")
-            e.add_field(
-                name=f"{status_icon} {ch_ref} · {cat_emoji(row['categoria'])} {row['categoria']}",
-                value=(
-                    f"👤 <@{row['user_id']}>{claimed}\n"
-                    f"{prio_icon} **{row['priority']}**{age}\n"
-                    f"📌 {row.get('subject') or '—'}"
-                ),
-                inline=False,
-            )
-        if not chunk:
-            e.description = "*Nessun ticket aperto al momento.*"
-        pages.append(e)
-
-    return pages
-
-
 # ══════════════════════════════════════════════════════════════════
 # CLOSE / FINALIZE
 # ══════════════════════════════════════════════════════════════════
@@ -751,9 +641,12 @@ async def _finalize(db: Database, channel: discord.TextChannel,
     if not ticket or ticket["status"] not in (TicketStatus.CLOSING.value, TicketStatus.OPEN.value):
         return
 
+    # Salva subito l'ID come int prima di qualsiasi await:
+    # l'oggetto Member può diventare stale dopo i 10 minuti di attesa.
     closer_id = closer.id
 
     # ── 1. Aggiorna DB e cache ────────────────────────────────────
+    # Se questa fase fallisce, non ha senso proseguire (dati inconsistenti).
     try:
         await db.update_status(channel.id, TicketStatus.CLOSED, closer_id, reason)
         _open_channels.discard(channel.id)
@@ -764,6 +657,7 @@ async def _finalize(db: Database, channel: discord.TextChannel,
         return
 
     # ── 2. Log + transcript ───────────────────────────────────────
+    # NON bloccante: un errore qui non impedisce la cancellazione del canale.
     try:
         log_ch = channel.guild.get_channel(cfg.LOG_CHANNEL_ID)
         if isinstance(log_ch, discord.TextChannel):
@@ -796,8 +690,10 @@ async def _finalize(db: Database, channel: discord.TextChannel,
             log.warning("Canale log non trovato (ID %d)", cfg.LOG_CHANNEL_ID)
     except Exception:
         log.exception("Errore log/transcript (canale %s) — la chiusura continua", channel.name)
+        # NON fare return: la cancellazione del canale deve avvenire comunque
 
     # ── 3. DM rating all'utente ───────────────────────────────────
+    # NON bloccante: se l'utente ha i DM chiusi o ha lasciato il server, proseguiamo.
     try:
         owner = channel.guild.get_member(ticket["user_id"])
         if owner:
@@ -807,16 +703,20 @@ async def _finalize(db: Database, channel: discord.TextChannel,
         log.exception("Errore DM rating (canale %s) — la chiusura continua", channel.name)
 
     # ── 4. Statistiche staff ──────────────────────────────────────
+    # NON bloccante.
     try:
         await db.bump_closed(closer_id)
     except Exception:
         log.exception("Errore bump_closed staff_id=%d — la chiusura continua", closer_id)
 
     # ── 5. ELIMINA IL CANALE ──────────────────────────────────────
+    # Questa fase è indipendente da tutto il resto e ha il suo try/except dedicato.
+    # È la fase più importante: deve avvenire sempre.
     try:
         await channel.delete(reason=f"Ticket chiuso da closer_id={closer_id}")
         log.info("Ticket #%s eliminato correttamente (closer_id=%d).", channel.name, closer_id)
     except discord.NotFound:
+        # Il canale è già stato eliminato manualmente: non è un errore.
         log.warning("Canale %d già eliminato manualmente, nessun problema.", channel.id)
     except discord.Forbidden:
         log.error("Permessi insufficienti per eliminare il canale %d.", channel.id)
@@ -957,39 +857,23 @@ class TicketModal(discord.ui.Modal):
             view_channel=True, send_messages=True, attach_files=True,
             manage_messages=True, manage_channels=True)
 
-        # ── Costruisce overwrites per staff e admin ────────────────
-        # Gli admin ottengono i permessi tramite ruolo (non vengono pingati).
-        # Il ping avviene solo sui ruoli staff NON admin.
+        staff_role  = guild.get_role(cfg.STAFF_TICKET_ROLE_ID) if cfg.STAFF_TICKET_ROLE_ID else None
+        admin_role  = guild.get_role(cfg.ADMIN_ROLE_ID)         if cfg.ADMIN_ROLE_ID         else None
+        crid        = get_category_role_id(self.categoria)
+        cat_role    = guild.get_role(crid) if crid else None
+
         overwrites: dict = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             user: discord.PermissionOverwrite(
                 view_channel=True, send_messages=True,
                 attach_files=True, read_message_history=True),
         }
-
-        # Ruoli staff (per categoria + generico) → permessi + ping
-        staff_mention_roles: list[discord.Role] = []
-        crid     = get_category_role_id(self.categoria)
-        cat_role = guild.get_role(crid) if crid else None
-
-        for role_id in cfg.staff_ids:
-            role = guild.get_role(role_id)
-            if role and role not in overwrites:
-                overwrites[role] = staff_perms
-                # Pinga solo se NON è un ruolo admin
-                if role_id not in cfg.admin_ids:
-                    staff_mention_roles.append(role)
-
-        if cat_role and cat_role.id not in overwrites:  # type: ignore[operator]
+        if staff_role:
+            overwrites[staff_role] = staff_perms
+        if cat_role and cat_role != staff_role:
             overwrites[cat_role] = staff_perms
-            if cat_role.id not in cfg.admin_ids:
-                staff_mention_roles.append(cat_role)
-
-        # Ruoli admin → permessi extra (senza ping)
-        for role_id in cfg.admin_ids:
-            role = guild.get_role(role_id)
-            if role:
-                overwrites[role] = admin_perms   # sovrascrive eventuali staff_perms
+        if admin_role:
+            overwrites[admin_role] = admin_perms
 
         ch_name = safe_channel_name(user.name, self.categoria)
 
@@ -1022,8 +906,10 @@ class TicketModal(discord.ui.Modal):
                 await channel.delete(reason="Rollback: errore DB post-creazione")
             return await reply("❌ Errore DB durante la creazione del ticket. Riprova.")
 
-        # Ping solo staff NON admin
-        mentions = " ".join(r.mention for r in staff_mention_roles) if staff_mention_roles else ""
+        mentions = " ".join(filter(None, [
+            staff_role.mention if staff_role else None,
+            cat_role.mention if cat_role and cat_role != staff_role else None,
+        ]))
         try:
             await channel.send(
                 content=f"{user.mention} {mentions}".strip(),
@@ -1340,30 +1226,6 @@ class TicketCog(commands.Cog):
         opened = ensure_tz(ticket.get("opened_at"))
         e.add_field(name="Aperto il", value=opened.strftime("%d/%m/%Y %H:%M") if opened else "—", inline=True)
         await interaction.response.send_message(embed=e, ephemeral=True)
-
-    @app_commands.command(name="tickets_aperti",
-                           description="[ADMIN] Mostra tutti i ticket aperti con stato e priorità.")
-    async def tickets_aperti(self, interaction: discord.Interaction) -> None:
-        """
-        Comando riservato agli admin: elenca tutti i ticket con status
-        'open' o 'closing', suddivisi in pagine da 10.
-        """
-        if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
-            return await interaction.response.send_message(
-                "❌ Questo comando è riservato agli amministratori.", ephemeral=True)
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        rows = await self.bot.db.get_all_open()
-        pages = embed_all_open(rows, interaction.guild)
-
-        if len(pages) == 1:
-            await interaction.followup.send(embed=pages[0], ephemeral=True)
-        else:
-            # Invia la prima pagina e le restanti come follow-up
-            await interaction.followup.send(embed=pages[0], ephemeral=True)
-            for page in pages[1:]:
-                await interaction.followup.send(embed=page, ephemeral=True)
 
     @app_commands.command(name="blacklist_add", description="Aggiungi utente alla blacklist ticket.")
     async def bl_add(self, interaction: discord.Interaction, user: discord.User,
