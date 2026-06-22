@@ -92,7 +92,7 @@ class Config:
 
     # FIX v4: tuple di int nativi invece di stringhe con virgole.
     # is_staff() ora confronta insiemi di int → nessun false-negative.
-    STAFF_TICKET_ROLE_IDS: tuple[int, ...] = (1499713651576406020, 1517091767399350342)
+    STAFF_TICKET_ROLE_IDS: tuple[int, ...] = (1499713651576406020)
     ADMIN_ROLE_IDS:        tuple[int, ...] = (1517123223836295188, 1517091767399350342)
 
     MAX_OPEN_TICKETS:        int = 200
