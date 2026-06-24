@@ -1002,17 +1002,37 @@ async def _finalize(bot: commands.Bot, db: Database, channel: discord.TextChanne
                 log_emb = embed_log(channel, ticket, notes)
 
                 if HAS_CHAT_EXPORTER:
+                    # FIX v7.2: chat_exporter.export() ritorna una STRINGA con
+                    # il contenuto HTML del transcript, non un percorso di file.
+                    # Il vecchio codice faceva `discord.File(export, ...)`
+                    # passando la stringa direttamente: discord.File tratta
+                    # una stringa come PATH su disco da aprire, quindi tentava
+                    # di aprire un "file" il cui nome era l'intero HTML,
+                    # fallendo con un'eccezione (catturata silenziosamente dal
+                    # blocco except più sotto). Il transcript non arrivava mai
+                    # nel canale di log, anche con bot/permessi corretti.
+                    # La libreria stessa documenta che va incapsulato in
+                    # io.BytesIO(...) prima di passarlo a discord.File().
                     export = await chat_exporter.export(
                         channel, limit=None, tz_info="Europe/Rome",
                         guild=channel.guild, bot=bot,
                     )
                     if export:
-                        await log_ch.send(
-                            embed=log_emb,
-                            file=discord.File(export, f"transcript-{channel.id}.html"),
+                        transcript_file = discord.File(
+                            io.BytesIO(export.encode("utf-8")),
+                            filename=f"transcript-{channel.id}.html",
                         )
+                        await log_ch.send(embed=log_emb, file=transcript_file)
                     else:
-                        await log_ch.send(embed=log_emb, content="⚠️ Export HTML fallito.")
+                        # chat_exporter ha restituito None: di solito significa
+                        # che ha incontrato un errore interno e l'ha già
+                        # stampato/loggato per conto suo.
+                        log.warning(
+                            "chat_exporter.export() ha restituito None per il canale %d "
+                            "(controlla i log per l'errore interno della libreria).",
+                            channel.id,
+                        )
+                        await log_ch.send(embed=log_emb, content="⚠️ Export HTML fallito (vedi log del bot).")
                 else:
                     msgs = [
                         f"[{m.created_at:%Y-%m-%d %H:%M:%S}] {m.author}: {m.content}"
