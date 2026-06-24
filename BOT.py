@@ -131,7 +131,7 @@ class Config:
     GUILD_ID:     int = field(default_factory=lambda: _int_env("GUILD_ID"))
     DATABASE_URL: str = field(default_factory=lambda: os.environ.get("DATABASE_URL", ""))
 
-    LOG_CHANNEL_ID:    int = 1517184033803604039
+    LOG_CHANNEL_ID:    int = 1519301949009170464
     CATEGORY_GENERAL:  int = 1499713653203533869
 
     STAFF_TICKET_ROLE_IDS: tuple[int, ...] = (1499713651576406020,)
