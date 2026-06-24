@@ -49,6 +49,29 @@ CHANGELOG v7:
 
 12. MIGLIORAMENTO – Config.validate() ora controlla anche LOG_CHANNEL_ID
     e stampa un warning (non fatale) se non trovato.
+
+CHANGELOG v7.1 (fix invio log/transcript):
+
+13. FIX CRITICO – Il transcript non veniva MAI inviato nel canale di log:
+    _finalize() passava `bot=channel.guild.me` a chat_exporter.export(),
+    ma chat_exporter si aspetta l'istanza del Client/Bot (per http, loop,
+    cache utenti...), non il Member che rappresenta il bot nel server.
+    Questo causava un'eccezione interna catturata silenziosamente dal
+    blocco "except Exception" generico: nessun messaggio arrivava nel
+    canale di log e l'unica traccia era una riga nel file di log del bot.
+    Ora l'istanza vera del bot viene passata attraverso schedule_close()
+    -> _finalize() -> chat_exporter.export(bot=bot, ...).
+
+14. MIGLIORAMENTO – Risoluzione del canale di log più robusta:
+    se LOG_CHANNEL_ID non è in cache (channel.guild.get_channel ritorna
+    None) si tenta un fetch_channel() diretto dall'API prima di arrendersi.
+    Vengono inoltre controllati esplicitamente i permessi del bot nel
+    canale di log (send_messages / embed_links / attach_files).
+
+15. MIGLIORAMENTO – Se l'invio del transcript fallisce per qualsiasi
+    motivo, viene mandato un messaggio di errore ESPLICITO nel canale
+    del ticket (prima che venga eliminato) con il motivo preciso, invece
+    di fallire in silenzio visibile solo nei log del bot.
 """
 
 from __future__ import annotations
@@ -870,7 +893,7 @@ def embed_notes_list(notes: list, channel_id: int) -> discord.Embed:
 # ══════════════════════════════════════════════════════════════════
 # CLOSE / FINALIZE
 # ══════════════════════════════════════════════════════════════════
-async def schedule_close(db: Database, channel: discord.TextChannel,
+async def schedule_close(bot: commands.Bot, db: Database, channel: discord.TextChannel,
                           closer: Union[discord.User, discord.Member],
                           reason: Optional[str] = None) -> bool:
     ticket = await db.get_ticket(channel.id)
@@ -888,7 +911,7 @@ async def schedule_close(db: Database, channel: discord.TextChannel,
     async def _do() -> None:
         try:
             await asyncio.sleep(cfg.CLOSE_DELAY)
-            await _finalize(db, channel, closer, reason)
+            await _finalize(bot, db, channel, closer, reason)
         except asyncio.CancelledError:
             log.info("Close annullato: %d", channel.id)
 
@@ -907,7 +930,7 @@ async def cancel_close(channel_id: int) -> bool:
     return False
 
 
-async def _finalize(db: Database, channel: discord.TextChannel,
+async def _finalize(bot: commands.Bot, db: Database, channel: discord.TextChannel,
                      closer: Union[discord.User, discord.Member],
                      reason: Optional[str]) -> None:
     ticket = await db.get_ticket(channel.id)
@@ -930,38 +953,95 @@ async def _finalize(db: Database, channel: discord.TextChannel,
             await channel.send("❌ Errore DB durante la chiusura. Riprova.")
         return
 
+    # ── Invio log/transcript ────────────────────────────────────────
+    # FIX v7.1: il vecchio codice passava `bot=channel.guild.me` a
+    # chat_exporter.export(). chat_exporter si aspetta l'istanza del
+    # Client/Bot (per http, loop, cache utenti...), NON il Member che
+    # rappresenta il bot dentro al server. Questo faceva fallire
+    # l'export con un'eccezione presa dal blocco "except Exception"
+    # qui sotto: il transcript non veniva mai inviato e l'unica traccia
+    # finiva nel file di log del bot, mai visibile su Discord.
+    #
+    # Ora passiamo la vera istanza del bot (arrivata da schedule_close)
+    # e aggiungiamo un fallback + diagnostica chiara se il canale di
+    # log non è raggiungibile o mancano permessi.
+    log_error_reason: Optional[str] = None
     try:
-        log_ch = channel.guild.get_channel(cfg.LOG_CHANNEL_ID)
-        if isinstance(log_ch, discord.TextChannel):
-            notes   = await db.get_notes(channel.id)
-            log_emb = embed_log(channel, ticket, notes)
+        log_ch = None
 
-            if HAS_CHAT_EXPORTER:
-                export = await chat_exporter.export(
-                    channel, limit=None, tz_info="Europe/Rome",
-                    guild=channel.guild, bot=channel.guild.me,
+        if not cfg.LOG_CHANNEL_ID:
+            log_error_reason = "LOG_CHANNEL_ID non configurato (valore 0)."
+        else:
+            log_ch = channel.guild.get_channel(cfg.LOG_CHANNEL_ID)
+            if log_ch is None:
+                # Il canale potrebbe non essere in cache: proviamo a
+                # recuperarlo direttamente dall'API prima di arrenderci.
+                try:
+                    log_ch = await channel.guild.fetch_channel(cfg.LOG_CHANNEL_ID)
+                except discord.NotFound:
+                    log_error_reason = (
+                        f"Nessun canale con ID {cfg.LOG_CHANNEL_ID} trovato in questo server."
+                    )
+                except discord.Forbidden:
+                    log_error_reason = (
+                        f"Il bot non ha i permessi per vedere il canale log (ID {cfg.LOG_CHANNEL_ID})."
+                    )
+                except discord.HTTPException as ex:
+                    log_error_reason = f"Errore Discord nel recuperare il canale log: {ex}"
+
+        if isinstance(log_ch, discord.TextChannel):
+            perms = log_ch.permissions_for(channel.guild.me)
+            if not (perms.send_messages and perms.embed_links and perms.attach_files):
+                log_error_reason = (
+                    f"Permessi insufficienti nel canale log #{log_ch.name} "
+                    f"(send_messages={perms.send_messages}, embed_links={perms.embed_links}, "
+                    f"attach_files={perms.attach_files})."
                 )
-                if export:
+            else:
+                notes   = await db.get_notes(channel.id)
+                log_emb = embed_log(channel, ticket, notes)
+
+                if HAS_CHAT_EXPORTER:
+                    export = await chat_exporter.export(
+                        channel, limit=None, tz_info="Europe/Rome",
+                        guild=channel.guild, bot=bot,
+                    )
+                    if export:
+                        await log_ch.send(
+                            embed=log_emb,
+                            file=discord.File(export, f"transcript-{channel.id}.html"),
+                        )
+                    else:
+                        await log_ch.send(embed=log_emb, content="⚠️ Export HTML fallito.")
+                else:
+                    msgs = [
+                        f"[{m.created_at:%Y-%m-%d %H:%M:%S}] {m.author}: {m.content}"
+                        async for m in channel.history(limit=None, oldest_first=True)
+                    ]
+                    buf = io.BytesIO("\n".join(msgs).encode())
                     await log_ch.send(
                         embed=log_emb,
-                        file=discord.File(export, f"transcript-{channel.id}.html"),
+                        file=discord.File(buf, f"transcript-{channel.id}.txt"),
                     )
-                else:
-                    await log_ch.send(embed=log_emb, content="⚠️ Export HTML fallito.")
-            else:
-                msgs = [
-                    f"[{m.created_at:%Y-%m-%d %H:%M:%S}] {m.author}: {m.content}"
-                    async for m in channel.history(limit=None, oldest_first=True)
-                ]
-                buf = io.BytesIO("\n".join(msgs).encode())
-                await log_ch.send(
-                    embed=log_emb,
-                    file=discord.File(buf, f"transcript-{channel.id}.txt"),
+        elif log_error_reason is None:
+            log_error_reason = (
+                f"Il canale con ID {cfg.LOG_CHANNEL_ID} non è un canale di testo valido."
+            )
+
+        if log_error_reason:
+            log.warning("Transcript NON inviato per ticket #%s: %s", channel.name, log_error_reason)
+            with contextlib.suppress(discord.HTTPException):
+                await channel.send(
+                    f"⚠️ Impossibile inviare il transcript al canale log: {log_error_reason}\n"
+                    "Controlla `LOG_CHANNEL_ID` e i permessi del bot in quel canale."
                 )
-        else:
-            log.warning("Canale log non trovato (ID %d)", cfg.LOG_CHANNEL_ID)
     except Exception:
         log.exception("Errore log/transcript (canale %s) — la chiusura continua", channel.name)
+        with contextlib.suppress(discord.HTTPException):
+            await channel.send(
+                "⚠️ Errore imprevisto durante l'invio del transcript. "
+                "Controlla i log del bot per i dettagli."
+            )
 
     try:
         owner = channel.guild.get_member(ticket["user_id"])
@@ -1331,7 +1411,7 @@ class CloseModal(discord.ui.Modal, title="🔒 Chiudi Ticket"):
             return
         await interaction.response.defer(ephemeral=True)
         ok = await schedule_close(
-            interaction.client.db, interaction.channel,
+            interaction.client, interaction.client.db, interaction.channel,
             interaction.user, self.reason.value or None,
         )
         if ok:
@@ -1510,7 +1590,7 @@ class TicketCog(commands.Cog):
                 ch = self.bot.get_channel(row["channel_id"])
                 if isinstance(ch, discord.TextChannel):
                     log.info("Auto-close: #%s (ID %d)", ch.name, ch.id)
-                    ok = await schedule_close(self.bot.db, ch, self.bot.user, "Chiusura automatica per inattività")
+                    ok = await schedule_close(self.bot, self.bot.db, ch, self.bot.user, "Chiusura automatica per inattività")
                     if ok:
                         closed += 1
             except Exception:
@@ -1645,7 +1725,7 @@ class TicketCog(commands.Cog):
                 f"⚠️ Ticket in stato `{ticket['status']}`, non chiudibile.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
         ok = await schedule_close(
-            db, interaction.channel, interaction.user, motivo or None
+            self.bot, db, interaction.channel, interaction.user, motivo or None
         )
         if ok:
             log.info("Ticket %d in chiusura avviata da %s (%d) via /close_ticket",
