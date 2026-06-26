@@ -72,6 +72,30 @@ CHANGELOG v7.1 (fix invio log/transcript):
     motivo, viene mandato un messaggio di errore ESPLICITO nel canale
     del ticket (prima che venga eliminato) con il motivo preciso, invece
     di fallire in silenzio visibile solo nei log del bot.
+
+CHANGELOG v7.3 (pannello ticket dinamico):
+
+16. FIX – embed_opened() ignorava il parametro `priority` e mostrava
+    sempre "🟢 Bassa" nel campo Priorità, indipendentemente dalla
+    priorità reale del ticket. Ora il campo riflette la priorità
+    effettiva passata alla funzione.
+
+17. NUOVO – Il messaggio-pannello del ticket (l'embed con Utente / Cat /
+    Priorità / Stato inviato all'apertura) viene salvato in DB
+    (panel_message_id) e ri-editato automaticamente quando cambia:
+    - la categoria (/move) → il campo "Cat" si aggiorna sul pannello;
+    - la priorità (bottone "Priorità" o relativo menu) → il campo
+      "Priorità" si aggiorna sul pannello;
+    - lo stato (chiusura richiesta con bottone "Chiudi"/ /close_ticket,
+      oppure riapertura con bottone "Riapri" / /reopen) → il campo
+      "Stato" passa a "🔒 Chiuso" (colore rosso) non appena la chiusura
+      viene richiesta, senza aspettare i CLOSE_DELAY secondi prima
+      dell'eliminazione del canale, e torna a "🟦 Aperto" se annullata.
+    - claim/unclaim (bottone "Prendi in Carico" / /claim / /unclaim) →
+      compare/scompare il campo "Preso in carico" sul pannello.
+    I ticket creati PRIMA di questo aggiornamento non hanno un
+    panel_message_id salvato: per loro il refresh viene semplicemente
+    ignorato (nessun errore), il resto del bot continua a funzionare.
 """
 
 from __future__ import annotations
@@ -315,11 +339,13 @@ CREATE TABLE IF NOT EXISTS tickets (
     closed_at              TIMESTAMPTZ,
     close_reason           TEXT,
     transcript             BYTEA,
-    opened_by_admin        BIGINT
+    opened_by_admin        BIGINT,
+    panel_message_id       BIGINT
 );
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_message_author_id BIGINT;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_ping TIMESTAMPTZ;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS opened_by_admin BIGINT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS panel_message_id BIGINT;
 
 CREATE TABLE IF NOT EXISTS blacklist (
     user_id  BIGINT PRIMARY KEY,
@@ -450,6 +476,11 @@ class Database:
         async with self._pool.acquire() as c:
             await c.execute("UPDATE tickets SET categoria=$1 WHERE channel_id=$2",
                             categoria, channel_id)
+
+    async def set_panel_message(self, channel_id: int, message_id: int) -> None:
+        async with self._pool.acquire() as c:
+            await c.execute("UPDATE tickets SET panel_message_id=$1 WHERE channel_id=$2",
+                            message_id, channel_id)
 
     async def count_open(self, user_id: int) -> int:
         async with self._pool.acquire() as c:
@@ -677,32 +708,138 @@ def embed_opened(
     ch_id: int,
     priority: Priority = Priority.LOW,
     opened_by: Optional[Union[discord.User, discord.Member]] = None,
+    opened_at: Optional[datetime.datetime] = None,
+    status_label: str = "🟦 Aperto",
+    status_color: Optional[int] = None,
+    claimed_by_id: Optional[int] = None,
+    closed_by_id: Optional[int] = None,
+    close_reason: Optional[str] = None,
 ) -> discord.Embed:
-    now = utcnow()
+    now   = opened_at or utcnow()
+    color = status_color if status_color is not None else cat_color(categoria)
     e = discord.Embed(
         title=f"{cat_emoji(categoria)}  Ticket — {categoria}",
         description=f"Benvenuto {user.mention}! Lo staff sarà con te a breve.",
-        color=discord.Color(cat_color(categoria)), timestamp=now,
+        color=discord.Color(color), timestamp=utcnow(),
     )
     e.add_field(name="👤  Utente",                  value=f"{user.mention}\n`{user.id}`", inline=True)
     e.add_field(name="🎮  Minecraft",               value=f"`{mc}`",                      inline=True)
     e.add_field(name=f"{cat_icon(categoria)}  Cat",  value=f"`{categoria}`",               inline=True)
     e.add_field(name="📌  Oggetto",     value=subj,                   inline=False)
     e.add_field(name="📝  Descrizione", value=f">>> {desc[:1000]}",   inline=False)
-    e.add_field(name="🎯  Priorità",    value=f"{Priority.LOW.icon} **{Priority.LOW.value}** `{Priority.LOW.bar}`", inline=True)
-    e.add_field(name="📊  Stato",       value="🟦 Aperto",            inline=True)
+    # FIX: in precedenza qui c'era sempre `Priority.LOW` hard-coded, quindi il
+    # campo Priorità mostrava sempre "Bassa" anche dopo un cambio di priorità.
+    e.add_field(name="🎯  Priorità",    value=f"{priority.icon} **{priority.value}** `{priority.bar}`", inline=True)
+    e.add_field(name="📊  Stato",       value=status_label,            inline=True)
     # MIGLIORAMENTO v7: timestamp Discord localizzato per ogni utente
     e.add_field(name="📅  Aperto il",   value=discord_ts(now),        inline=True)
     e.add_field(name="🆔  ID",          value=f"`{ch_id}`",           inline=True)
+    if claimed_by_id:
+        e.add_field(name="🙋  Preso in carico", value=f"<@{claimed_by_id}>", inline=True)
     if opened_by and opened_by.id != user.id:
         e.add_field(
             name="🛡️  Aperto da Admin",
             value=f"{opened_by.mention} ha aperto questo ticket per conto dell'utente.",
             inline=False,
         )
+    if closed_by_id:
+        e.add_field(name="🔒  Chiuso da", value=f"<@{closed_by_id}>", inline=True)
+    if close_reason:
+        e.add_field(name="📄  Motivo chiusura", value=close_reason[:300], inline=False)
     e.set_author(name=str(user), icon_url=user.display_avatar.url)
-    e.set_footer(text="Rispondi qui per comunicare con lo staff")
+    e.set_footer(
+        text="Rispondi qui per comunicare con lo staff" if status_label.endswith("Aperto")
+        else "Il canale verrà eliminato a breve · Usa /reopen per annullare"
+    )
     return e
+
+
+# ══════════════════════════════════════════════════════════════════
+# PANNELLO TICKET DINAMICO
+# ══════════════════════════════════════════════════════════════════
+# NUOVO: il messaggio-pannello (l'embed con Utente/Cat/Priorità/Stato inviato
+# all'apertura del ticket) viene ora salvato in DB (panel_message_id) e
+# rieditato ogni volta che cambia qualcosa di rilevante: categoria (/move),
+# priorità (bottone/menu Priorità) e stato (chiusura/riapertura). Così il
+# pannello mostra sempre i dati aggiornati, invece di restare "congelato"
+# ai valori di apertura.
+
+def panel_status_display(status: str) -> tuple[str, Optional[int]]:
+    """Etichetta + colore del campo Stato in base allo stato persistito del ticket."""
+    if status == TicketStatus.OPEN.value:
+        return "🟦 Aperto", None
+    # CLOSING e CLOSED condividono lo stesso "look" chiuso nel pannello:
+    # appena la chiusura viene richiesta il pannello deve riflettere subito
+    # lo stato "chiuso" (il canale verrà eliminato dopo CLOSE_DELAY secondi).
+    return "🔒 Chiuso", 0xED4245
+
+
+async def build_panel_embed(bot: commands.Bot, guild: discord.Guild,
+                             ticket: dict) -> Optional[discord.Embed]:
+    """Ricostruisce l'embed del pannello a partire dallo stato attuale del ticket."""
+    user = guild.get_member(ticket["user_id"])
+    if user is None:
+        with contextlib.suppress(discord.HTTPException):
+            user = await guild.fetch_member(ticket["user_id"])
+    if user is None:
+        with contextlib.suppress(discord.HTTPException):
+            user = await bot.fetch_user(ticket["user_id"])
+    if user is None:
+        log.warning("build_panel_embed: utente %d non risolvibile (canale %d)",
+                    ticket["user_id"], ticket["channel_id"])
+        return None
+
+    opened_by = guild.get_member(ticket["opened_by_admin"]) if ticket.get("opened_by_admin") else None
+
+    try:
+        priority = Priority(ticket.get("priority") or Priority.LOW.value)
+    except ValueError:
+        priority = Priority.LOW
+
+    status_label, status_color = panel_status_display(ticket["status"])
+
+    return embed_opened(
+        user, ticket["categoria"], ticket.get("mc_name") or "—",
+        ticket.get("subject") or "—", ticket.get("description") or "—",
+        ticket["channel_id"],
+        priority=priority,
+        opened_by=opened_by,
+        opened_at=ensure_tz(ticket.get("opened_at")),
+        status_label=status_label,
+        status_color=status_color,
+        claimed_by_id=ticket.get("claimed_by"),
+        closed_by_id=ticket.get("closed_by"),
+        close_reason=ticket.get("close_reason"),
+    )
+
+
+async def refresh_ticket_panel(bot: commands.Bot, db: Database, channel: discord.TextChannel,
+                                ticket: Optional[dict] = None) -> None:
+    """Modifica il messaggio-pannello del ticket per riflettere lo stato attuale.
+
+    `ticket` può essere passato già con campi "in volo" (es. status=CLOSING e
+    closed_by/close_reason ancora non persistiti su DB durante la finestra di
+    CLOSE_DELAY) per mostrare subito il risultato senza aspettare il DB.
+    """
+    ticket = ticket or await db.get_ticket(channel.id)
+    if not ticket:
+        return
+    msg_id = ticket.get("panel_message_id")
+    if not msg_id:
+        return  # ticket creato prima di questa funzionalità: nessun pannello da aggiornare
+
+    try:
+        msg = await channel.fetch_message(msg_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        log.warning("Pannello ticket non trovato/non accessibile (canale %d, msg %s)", channel.id, msg_id)
+        return
+
+    embed = await build_panel_embed(bot, channel.guild, ticket)
+    if embed is None:
+        return
+
+    with contextlib.suppress(discord.HTTPException):
+        await msg.edit(embed=embed, view=TicketControlView())
 
 
 def embed_closing(closer: Union[discord.User, discord.Member],
@@ -906,6 +1043,17 @@ async def schedule_close(bot: commands.Bot, db: Database, channel: discord.TextC
             await channel.send("⚠️ Chiusura già in corso (o ticket non più aperto).", delete_after=8)
         return False
 
+    # NUOVO: il pannello viene aggiornato subito allo stato "chiuso" (vedi
+    # richiesta: "se il ticket è chiuso, il pannello cambia aspetto"), senza
+    # aspettare i CLOSE_DELAY secondi prima dell'eliminazione effettiva del
+    # canale. closed_by/close_reason non sono ancora su DB a questo punto
+    # (vengono persistiti solo in _finalize), quindi li passiamo "in volo".
+    ticket_for_panel = dict(ticket)
+    ticket_for_panel["status"]       = TicketStatus.CLOSING.value
+    ticket_for_panel["closed_by"]    = closer.id
+    ticket_for_panel["close_reason"] = reason
+    await refresh_ticket_panel(bot, db, channel, ticket_for_panel)
+
     await channel.send(embed=embed_closing(closer, cfg.CLOSE_DELAY, reason))
 
     async def _do() -> None:
@@ -928,6 +1076,18 @@ async def cancel_close(channel_id: int) -> bool:
         task.cancel()
         return True
     return False
+
+
+async def perform_reopen(bot: commands.Bot, db: Database, channel: discord.TextChannel) -> None:
+    """Annulla la chiusura programmata, riapre il ticket e riporta il pannello
+    all'aspetto "Aperto" (centralizzato qui per evitare duplicazione tra
+    bottone e slash command /reopen)."""
+    await cancel_close(channel.id)
+    await db.reopen(channel.id)
+    _open_channels.add(channel.id)
+    ticket = await db.get_ticket(channel.id)
+    if ticket:
+        await refresh_ticket_panel(bot, db, channel, ticket)
 
 
 async def _finalize(bot: commands.Bot, db: Database, channel: discord.TextChannel,
@@ -1172,7 +1332,7 @@ async def create_ticket_channel(
     )
 
     try:
-        await channel.send(
+        panel_msg = await channel.send(
             content=f"{target_user.mention} {mentions}".strip(),
             embed=embed_opened(
                 target_user, categoria, mc_name, subject, description,
@@ -1180,6 +1340,8 @@ async def create_ticket_channel(
             ),
             view=TicketControlView(),
         )
+        with contextlib.suppress(Exception):
+            await db.set_panel_message(channel.id, panel_msg.id)
     except Exception:
         log.exception("Errore inviando embed nel canale ticket %d", channel.id)
 
@@ -1372,9 +1534,7 @@ class TicketControlView(discord.ui.View):
             return await interaction.response.send_message("⚠️ Già aperto.", ephemeral=True)
         if ticket["status"] == TicketStatus.CLOSED.value:
             return await interaction.response.send_message("❌ Ticket già chiuso definitivamente.", ephemeral=True)
-        await cancel_close(interaction.channel_id)
-        await db.reopen(interaction.channel_id)
-        _open_channels.add(interaction.channel_id)
+        await perform_reopen(interaction.client, db, interaction.channel)
         await interaction.response.send_message(embed=embed_reopened(interaction.user))
 
     @discord.ui.button(label="Prendi in Carico", style=discord.ButtonStyle.blurple, emoji="🙋", custom_id="tc:claim",   row=0)
@@ -1388,6 +1548,7 @@ class TicketControlView(discord.ui.View):
                 f"⚠️ Già gestito da <@{ticket['claimed_by']}>.", ephemeral=True)
         await db.claim_ticket(interaction.channel_id, interaction.user.id)
         await db.bump_claimed(interaction.user.id)
+        await refresh_ticket_panel(interaction.client, db, interaction.channel)
         await interaction.response.send_message(embed=embed_claimed(interaction.user))
 
     @discord.ui.button(label="Priorità",         style=discord.ButtonStyle.gray,    emoji="↕️", custom_id="tc:priority", row=1)
@@ -1509,8 +1670,13 @@ class PriorityView(discord.ui.View):
     )
     async def sel(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
         p = Priority(select.values[0])
-        await interaction.client.db.set_priority(self.channel_id, p)
+        db: Database = interaction.client.db
+        await db.set_priority(self.channel_id, p)
         await interaction.response.send_message(embed=embed_priority_set(p, interaction.user), ephemeral=False)
+        channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) \
+            else interaction.client.get_channel(self.channel_id)
+        if isinstance(channel, discord.TextChannel):
+            await refresh_ticket_panel(interaction.client, db, channel)
         self.stop()
 
 
@@ -1718,9 +1884,7 @@ class TicketCog(commands.Cog):
             return await interaction.response.send_message("⚠️ Già aperto.", ephemeral=True)
         if ticket["status"] == TicketStatus.CLOSED.value:
             return await interaction.response.send_message("❌ Già chiuso definitivamente.", ephemeral=True)
-        await cancel_close(interaction.channel_id)
-        await db.reopen(interaction.channel_id)
-        _open_channels.add(interaction.channel_id)
+        await perform_reopen(self.bot, db, interaction.channel)
         log.info("Ticket %d riaperto da %s (%d)", interaction.channel_id, interaction.user, interaction.user.id)
         await interaction.response.send_message(embed=embed_reopened(interaction.user))
 
@@ -1771,6 +1935,7 @@ class TicketCog(commands.Cog):
                 f"⚠️ Già gestito da <@{ticket['claimed_by']}>.", ephemeral=True)
         await db.claim_ticket(interaction.channel_id, interaction.user.id)
         await db.bump_claimed(interaction.user.id)
+        await refresh_ticket_panel(self.bot, db, interaction.channel)
         log.info("Ticket %d claimed da %s (%d)", interaction.channel_id, interaction.user, interaction.user.id)
         await interaction.response.send_message(embed=embed_claimed(interaction.user))
 
@@ -1792,6 +1957,7 @@ class TicketCog(commands.Cog):
             return await interaction.response.send_message(
                 f"❌ Solo <@{ticket['claimed_by']}> o un Admin può rilasciare questo ticket.", ephemeral=True)
         await db.unclaim_ticket(interaction.channel_id)
+        await refresh_ticket_panel(self.bot, db, interaction.channel)
         log.info("Ticket %d unclaimed da %s (%d)", interaction.channel_id, interaction.user, interaction.user.id)
         await interaction.response.send_message(embed=embed_unclaimed(interaction.user))
 
@@ -1964,6 +2130,9 @@ class TicketCog(commands.Cog):
             await interaction.followup.send(
                 "⚠️ Canale aggiornato ma errore nel DB. Contatta un admin.", ephemeral=True)
             return
+
+        ticket["categoria"] = nuova_categoria
+        await refresh_ticket_panel(self.bot, db, channel, ticket)
 
         crid     = get_category_role_id(nuova_categoria)
         new_role = guild.get_role(crid) if crid else None
